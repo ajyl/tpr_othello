@@ -33,7 +33,6 @@ from intervene_probe import (  # noqa: E402
     INTERVENTION_TYPE_CHOICES,
     OthelloBoardState,
     STARTING_SQUARES,
-    apply_interventions_to_board_state,
     assign_intervention_types_to_samples,
     board_pos_to_label,
     color_code_to_label,
@@ -54,7 +53,6 @@ from intervene_probe import (  # noqa: E402
     sort_move_labels,
 )
 from train_tpr_probe import (  # noqa: E402
-    load_binding_to_residual_linear_map_from_artifact,
     load_saved_tpr_probe,
 )
 
@@ -73,15 +71,12 @@ SQUARE_WEIGHT_LABELS = {
 }
 FIXED_PROBE_DIR = Path("probes/tpr")
 FIXED_N_HEAD = 8
-FIXED_ROLE_DIM = 16
-FIXED_FILLER_DIM = 8
-FIXED_USE_BIAS = False
-FIXED_EXCLUDE_CENTER_SQUARES = False
 FIXED_BINDING_CONSTRUCTION_METHOD = "outer_products"
 FIXED_PATCH_TARGET_NAME = "residual"
 FIXED_PATCH_TARGET = "hook_resid_post"
 FIXED_RESIDUAL_PROJECTION = "pinv"
 FIXED_PREDICTION_MODE = "probability_threshold"
+FIXED_PROBE_FILENAME_TEMPLATE = "resid_{layer}_tpr_r16_f8.pth"
 DEFAULT_PATCH_LAYERS = (2, 3, 4, 5, 6, 7)
 DEFAULT_SCALE_VALUES = (
     0.25,
@@ -95,8 +90,7 @@ DEFAULT_SCALE_VALUES = (
     2.25,
     2.5,
 )
-DEFAULT_TWO_SQUARE_SCALE_VALUES = DEFAULT_SCALE_VALUES + (2.75,)
-DEFAULT_SQUARE_WEIGHT_VALUES = (
+FIXED_SQUARE_WEIGHT_VALUES = (
     0.25,
     0.5,
     0.75,
@@ -108,24 +102,13 @@ DEFAULT_SQUARE_WEIGHT_VALUES = (
     2.25,
     2.5,
 )
-DEFAULT_PREDICTION_PROBABILITY_THRESHOLD = 1e-2
-FIXED_SQUARE_WEIGHT_VALUES = DEFAULT_SQUARE_WEIGHT_VALUES
-FIXED_PREDICTION_PROBABILITY_THRESHOLD = DEFAULT_PREDICTION_PROBABILITY_THRESHOLD
+FIXED_PREDICTION_PROBABILITY_THRESHOLD = 1e-2
 TOPK_EXTRA_LOGGED_MOVES = 5
-
-
-def make_tpr_probe_filename(layer: int) -> str:
-    stem = f"resid_{layer}_tpr_r{FIXED_ROLE_DIM}_f{FIXED_FILLER_DIM}"
-    if FIXED_USE_BIAS:
-        stem += "_bias"
-    if FIXED_EXCLUDE_CENTER_SQUARES:
-        stem += "_no_center"
-    return f"{stem}.pth"
 
 
 def resolve_tpr_probe_path(*, layer: int) -> Path:
     resolved_probe_dir = FIXED_PROBE_DIR
-    filename = make_tpr_probe_filename(layer=layer)
+    filename = FIXED_PROBE_FILENAME_TEMPLATE.format(layer=layer)
     direct_path = resolved_probe_dir / filename
     if direct_path.exists():
         return direct_path
@@ -141,7 +124,10 @@ def resolve_tpr_probe_path(*, layer: int) -> Path:
         )
     return matches[0]
 
-def parse_explicit_probe_pairs(raw_pairs: tuple[str, ...] | list[str]) -> dict[int, Path]:
+
+def parse_explicit_probe_pairs(
+    raw_pairs: tuple[str, ...] | list[str]
+) -> dict[int, Path]:
     pairs: dict[int, Path] = {}
     for raw_pair in raw_pairs:
         if "=" in raw_pair:
@@ -163,6 +149,7 @@ def parse_explicit_probe_pairs(raw_pairs: tuple[str, ...] | list[str]) -> dict[i
             raise FileNotFoundError(f"TPR probe checkpoint not found: {probe_path}")
         pairs[patch_layer] = probe_path
     return pairs
+
 
 def canonicalize_square_weight_tuple(
     square_weights: Sequence[float],
@@ -209,7 +196,9 @@ def resolve_square_weight_tuples(
             raw_square_weight_tuple,
             expected_length=num_intervened_squares,
         )
-        dedupe_key = tuple(round(weight, 12) for weight in canonical_square_weight_tuple)
+        dedupe_key = tuple(
+            round(weight, 12) for weight in canonical_square_weight_tuple
+        )
         if dedupe_key in seen_keys:
             continue
         seen_keys.add(dedupe_key)
@@ -228,12 +217,6 @@ def default_output_path(num_intervened_squares: int) -> str:
         f"tpr_{SQUARE_COUNT_WORDS[num_intervened_squares]}_square_"
         "intervention_results.json"
     )
-
-
-def default_scale_values(num_intervened_squares: int) -> tuple[float, ...]:
-    if num_intervened_squares == 2:
-        return DEFAULT_TWO_SQUARE_SCALE_VALUES
-    return DEFAULT_SCALE_VALUES
 
 
 def default_require_reasonable_post_state(num_intervened_squares: int) -> bool:
@@ -261,40 +244,10 @@ def build_square_weight_selection_description(num_intervened_squares: int) -> st
     if num_intervened_squares == 1:
         return "min(error, scale)"
     weight_terms = ", ".join(
-        f"square_weight_{idx}"
-        for idx in range(1, num_intervened_squares + 1)
+        f"square_weight_{idx}" for idx in range(1, num_intervened_squares + 1)
     )
     ones = ", ".join("1" for _idx in range(num_intervened_squares))
-    return (
-        f"min(error, scale, square_weight_deviation_from_({ones}), {weight_terms})"
-    )
-
-
-def build_pre_and_post_board_states(
-    completion: Sequence[int],
-    pos_ints: Sequence[int],
-    ori_colors: Sequence[int],
-    *,
-    intervention_type: str = "flip",
-) -> tuple[OthelloBoardState, OthelloBoardState]:
-    normalized_pos_ints, normalized_ori_colors = normalize_square_positions_and_colors(
-        pos_ints,
-        ori_colors,
-        num_intervened_squares=len(pos_ints),
-    )
-
-    board_state = OthelloBoardState()
-    for move in completion:
-        board_state.umpire(int(move))
-
-    modified_board = board_state.copy()
-    apply_interventions_to_board_state(
-        modified_board,
-        pos_ints=normalized_pos_ints,
-        ori_colors=normalized_ori_colors,
-        intervention_type=intervention_type,
-    )
-    return board_state, modified_board
+    return f"min(error, scale, square_weight_deviation_from_({ones}), {weight_terms})"
 
 
 def filter_benchmark_samples(
@@ -306,11 +259,13 @@ def filter_benchmark_samples(
 ) -> list[dict]:
     filtered = []
     for sample in samples:
-        pre_valids, post_valids, is_reasonable = compute_pre_and_post_valids_for_squares(
-            completion=sample["completion"],
-            pos_ints=sample["pos_ints"],
-            ori_colors=sample["ori_colors"],
-            intervention_type=sample.get("intervention_type", "flip"),
+        pre_valids, post_valids, is_reasonable = (
+            compute_pre_and_post_valids_for_squares(
+                completion=sample["completion"],
+                pos_ints=sample["pos_ints"],
+                ori_colors=sample["ori_colors"],
+                intervention_type=sample.get("intervention_type", "flip"),
+            )
         )
         if require_reasonable_post_state and not is_reasonable:
             continue
@@ -365,12 +320,16 @@ def generate_benchmark_from_data(
         if len(occupied_positions) < num_intervened_squares:
             continue
 
-        chosen_positions = [int(position) for position in rng.sample(
-            occupied_positions,
-            num_intervened_squares,
-        )]
+        chosen_positions = [
+            int(position)
+            for position in rng.sample(
+                occupied_positions,
+                num_intervened_squares,
+            )
+        ]
         chosen_colors = [
-            int(board_state.state.flatten()[pos_int] + 1) for pos_int in chosen_positions
+            int(board_state.state.flatten()[pos_int] + 1)
+            for pos_int in chosen_positions
         ]
         pos_ints, ori_colors = normalize_square_positions_and_colors(
             chosen_positions,
@@ -381,11 +340,13 @@ def generate_benchmark_from_data(
             intervention_type,
             rng=rng,
         )
-        pre_valids, post_valids, is_reasonable = compute_pre_and_post_valids_for_squares(
-            completion=completion,
-            pos_ints=pos_ints,
-            ori_colors=ori_colors,
-            intervention_type=resolved_intervention_type,
+        pre_valids, post_valids, is_reasonable = (
+            compute_pre_and_post_valids_for_squares(
+                completion=completion,
+                pos_ints=pos_ints,
+                ori_colors=ori_colors,
+                intervention_type=resolved_intervention_type,
+            )
         )
         if require_reasonable_post_state and not is_reasonable:
             continue
@@ -439,7 +400,9 @@ def load_benchmark(
                 raw_samples = raw_samples["samples"]
             elif "benchmark" in raw_samples:
                 raw_samples = raw_samples["benchmark"]
-        if not isinstance(raw_samples, Sequence) or isinstance(raw_samples, (str, bytes)):
+        if not isinstance(raw_samples, Sequence) or isinstance(
+            raw_samples, (str, bytes)
+        ):
             raise ValueError(
                 f"Unsupported benchmark artifact schema in {benchmark_path!r}; "
                 "expected a sequence of samples"
@@ -473,13 +436,14 @@ def load_benchmark(
         require_reasonable_post_state=require_reasonable_post_state,
     )
 
+
 def load_tpr_factors(
     probe_path: str | Path,
     *,
     d_model: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict | None, int, dict]:
-    probe, layer, artifact = load_saved_tpr_probe(
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    probe, layer, _artifact = load_saved_tpr_probe(
         probe_path=probe_path,
         d_model=d_model,
         device=device,
@@ -488,9 +452,7 @@ def load_tpr_factors(
         probe.binding_map.detach().to(device),
         probe.role_embeddings.detach().to(device),
         probe.filler_embeddings.detach().to(device),
-        load_binding_to_residual_linear_map_from_artifact(artifact, device=device),
         layer,
-        artifact,
     )
 
 
@@ -526,14 +488,9 @@ def build_binding_space_constraints_for_squares(
         selected_filler_deltas.append(
             filler_embeddings[target_channel] - filler_embeddings[source_channel]
         )
-    return torch.stack(selected_roles, dim=0), torch.stack(selected_filler_deltas, dim=0)
-
-
-def solve_binding_delta_for_selected_squares(
-    selected_roles: torch.Tensor,
-    selected_filler_deltas: torch.Tensor,
-) -> torch.Tensor:
-    return torch.linalg.pinv(selected_roles) @ selected_filler_deltas
+    return torch.stack(selected_roles, dim=0), torch.stack(
+        selected_filler_deltas, dim=0
+    )
 
 
 def build_binding_delta_as_sum_of_outer_products(
@@ -559,94 +516,13 @@ def apply_square_weights_to_selected_filler_deltas(
     return selected_filler_deltas * weight_tensor
 
 
-def board_value_to_tpr_filler_channel(board_value: int, *, move_idx: int) -> int:
-    if board_value == EMPTY:
-        return 0
-    if board_value not in (-1, 1):
-        raise ValueError(f"Unexpected board value {board_value}; expected -1, 0, or 1")
-    original_color = int(board_value + 1)
-    source_channel, _target_channel = probe_patch_channels_for_square_color(
-        original_color=original_color,
-        move_idx=move_idx,
-    )
-    return source_channel
-
-
-def build_binding_tensor_from_board_state(
-    role_embeddings: torch.Tensor,
-    filler_embeddings: torch.Tensor,
-    *,
-    board_state: np.ndarray | torch.Tensor,
-    move_idx: int,
-) -> torch.Tensor:
-    board_state_tensor = torch.as_tensor(
-        board_state,
-        device=role_embeddings.device,
-        dtype=torch.long,
-    )
-    filler_channel_ids = torch.empty_like(board_state_tensor)
-    for row_idx in range(board_state_tensor.shape[0]):
-        for col_idx in range(board_state_tensor.shape[1]):
-            filler_channel_ids[row_idx, col_idx] = board_value_to_tpr_filler_channel(
-                int(board_state_tensor[row_idx, col_idx].item()),
-                move_idx=move_idx,
-            )
-
-    selected_fillers = filler_embeddings[filler_channel_ids]
-    return torch.einsum("xyr,xyf->rf", role_embeddings, selected_fillers)
-
-
-def build_binding_delta_from_full_board_reconstruction(
-    role_embeddings: torch.Tensor,
-    filler_embeddings: torch.Tensor,
-    *,
-    completion: Sequence[int],
-    pos_ints: Sequence[int],
-    ori_colors: Sequence[int],
-    move_idx: int,
-    intervention_type: str = "flip",
-) -> torch.Tensor:
-    original_board, modified_board = build_pre_and_post_board_states(
-        completion,
-        pos_ints,
-        ori_colors,
-        intervention_type=intervention_type,
-    )
-    original_binding = build_binding_tensor_from_board_state(
-        role_embeddings,
-        filler_embeddings,
-        board_state=original_board.state,
-        move_idx=move_idx,
-    )
-    target_binding = build_binding_tensor_from_board_state(
-        role_embeddings,
-        filler_embeddings,
-        board_state=modified_board.state,
-        move_idx=move_idx,
-    )
-    return target_binding - original_binding
-
-
 def solve_residual_delta_for_binding_delta(
     binding_map: torch.Tensor,
     delta_binding: torch.Tensor,
-    *,
-    binding_to_residual: dict | None = None,
 ) -> torch.Tensor:
     delta_binding_flat = delta_binding.reshape(-1)
-    if binding_to_residual is not None:
-        weight = binding_to_residual["weight"]
-        return delta_binding_flat.to(device=weight.device, dtype=weight.dtype) @ weight
-
     binding_map_flat = binding_map.reshape(binding_map.shape[0], -1)
     return torch.linalg.pinv(binding_map_flat.T) @ delta_binding_flat
-
-
-def apply_probe_adjoint_to_binding_delta(
-    binding_map: torch.Tensor,
-    delta_binding: torch.Tensor,
-) -> torch.Tensor:
-    return torch.einsum("drf,rf->d", binding_map, delta_binding)
 
 
 def tpr_binding_space_patch_direction_for_squares(
@@ -654,67 +530,33 @@ def tpr_binding_space_patch_direction_for_squares(
     role_embeddings: torch.Tensor,
     filler_embeddings: torch.Tensor,
     *,
-    binding_to_residual: dict | None,
-    completion: Sequence[int],
     pos_ints: Sequence[int],
     ori_colors: Sequence[int],
     move_idx: int,
     intervention_type: str = "flip",
-    binding_construction_method: str = "solve",
     square_weights: Sequence[float],
 ) -> torch.Tensor:
-    selected_roles, selected_filler_deltas = build_binding_space_constraints_for_squares(
-        role_embeddings,
-        filler_embeddings,
-        pos_ints=pos_ints,
-        ori_colors=ori_colors,
-        move_idx=move_idx,
-        intervention_type=intervention_type,
-    )
-
-    if binding_construction_method == "full_rebuild":
-        delta_binding = build_binding_delta_from_full_board_reconstruction(
+    selected_roles, selected_filler_deltas = (
+        build_binding_space_constraints_for_squares(
             role_embeddings,
             filler_embeddings,
-            completion=completion,
             pos_ints=pos_ints,
             ori_colors=ori_colors,
             move_idx=move_idx,
             intervention_type=intervention_type,
         )
-    else:
-        weighted_filler_deltas = apply_square_weights_to_selected_filler_deltas(
+    )
+    delta_binding = build_binding_delta_as_sum_of_outer_products(
+        selected_roles,
+        apply_square_weights_to_selected_filler_deltas(
             selected_filler_deltas,
             square_weights,
-        )
-        if binding_construction_method == "solve":
-            delta_binding = solve_binding_delta_for_selected_squares(
-                selected_roles,
-                weighted_filler_deltas,
-            )
-        elif binding_construction_method in (
-            "outer_products",
-            "adjoint_outer_products",
-        ):
-            delta_binding = build_binding_delta_as_sum_of_outer_products(
-                selected_roles,
-                weighted_filler_deltas,
-            )
-        else:
-            raise ValueError(
-                "Unknown binding construction method "
-                f"{binding_construction_method!r}; expected one of "
-                "('adjoint_outer_products', 'outer_products', 'solve', 'full_rebuild')"
-            )
-
-    if binding_construction_method == "adjoint_outer_products":
-        direction = apply_probe_adjoint_to_binding_delta(binding_map, delta_binding)
-    else:
-        direction = solve_residual_delta_for_binding_delta(
-            binding_map,
-            delta_binding,
-            binding_to_residual=binding_to_residual,
-        )
+        ),
+    )
+    direction = solve_residual_delta_for_binding_delta(
+        binding_map,
+        delta_binding,
+    )
     return direction / direction.norm().clamp_min(1e-12)
 
 
@@ -727,43 +569,18 @@ class PredictionSnapshot:
     eval_preds: list[str]
 
 
-def select_logged_and_eval_predictions(
-    ranked_with_probs: list[tuple[int, float]],
-    *,
-    prediction_mode: str,
-    num_moves: int,
-    probability_threshold: float,
-) -> tuple[list[int], list[tuple[int, float]]]:
-    if prediction_mode == "probability_threshold":
-        logged_preds = [
-            (move, probability)
-            for move, probability in ranked_with_probs
-            if probability > probability_threshold
-        ]
-        return [move for move, _probability in logged_preds], logged_preds
-
-    if prediction_mode == "topk":
-        eval_preds = [move for move, _probability in ranked_with_probs[:num_moves]]
-        logged_preds = ranked_with_probs[: num_moves + TOPK_EXTRA_LOGGED_MOVES]
-        return eval_preds, logged_preds
-
-    raise ValueError(f"Unsupported prediction_mode: {prediction_mode}")
-
-
 def build_prediction_snapshot(
     ranked_with_probs: list[tuple[int, float]],
     *,
-    prediction_mode: str,
     num_reference_moves: int,
     probability_threshold: float,
 ) -> PredictionSnapshot:
-    selected_moves, _logged_preds = select_logged_and_eval_predictions(
-        ranked_with_probs,
-        prediction_mode=prediction_mode,
-        num_moves=num_reference_moves,
-        probability_threshold=probability_threshold,
-    )
     probability_by_move = dict(ranked_with_probs)
+    selected_moves = [
+        move
+        for move, probability in ranked_with_probs
+        if probability > probability_threshold
+    ]
     return PredictionSnapshot(
         selected_moves=selected_moves,
         probability_by_move=probability_by_move,
@@ -810,134 +627,61 @@ def candidate_selection_key(
 
 def resolve_tpr_resources_for_patch_layers(
     *,
-    config: "TPRInterventionConfig",
+    probe_pairs: tuple[str, ...],
     d_model: int,
     device: torch.device,
 ) -> tuple[
     tuple[int, ...],
     dict[int, int],
     dict[int, str],
-    dict[int, dict],
     dict[int, torch.Tensor],
     dict[int, torch.Tensor],
     dict[int, torch.Tensor],
-    dict[int, dict | None],
 ]:
-    explicit_probe_pairs = parse_explicit_probe_pairs(config.probe_pairs)
-    patch_layers = tuple(sorted(explicit_probe_pairs)) if explicit_probe_pairs else DEFAULT_PATCH_LAYERS
+    explicit_probe_pairs = parse_explicit_probe_pairs(probe_pairs)
+    patch_layers = (
+        tuple(sorted(explicit_probe_pairs))
+        if explicit_probe_pairs
+        else DEFAULT_PATCH_LAYERS
+    )
 
     probe_source_layers: dict[int, int] = {}
     probe_paths_by_patch_layer: dict[int, str] = {}
-    probe_configs_by_patch_layer: dict[int, dict] = {}
     binding_maps_by_patch_layer: dict[int, torch.Tensor] = {}
     role_embeddings_by_patch_layer: dict[int, torch.Tensor] = {}
     filler_embeddings_by_patch_layer: dict[int, torch.Tensor] = {}
-    binding_to_residual_by_patch_layer: dict[int, dict | None] = {}
 
-    if explicit_probe_pairs:
-        for patch_layer in patch_layers:
-            probe_path = explicit_probe_pairs[patch_layer]
-            (
-                binding_map,
-                role_embeddings,
-                filler_embeddings,
-                binding_to_residual,
-                loaded_layer,
-                artifact,
-            ) = load_tpr_factors(
+    for patch_layer in patch_layers:
+        probe_path = (
+            explicit_probe_pairs[patch_layer]
+            if explicit_probe_pairs
+            else resolve_tpr_probe_path(layer=patch_layer)
+        )
+        binding_map, role_embeddings, filler_embeddings, loaded_layer = (
+            load_tpr_factors(
                 probe_path,
                 d_model=d_model,
                 device=device,
             )
-            probe_source_layers[patch_layer] = loaded_layer
-            probe_paths_by_patch_layer[patch_layer] = str(probe_path)
-            probe_configs_by_patch_layer[patch_layer] = {
-                "layer": loaded_layer,
-                "role_dim": int(artifact["role_dim"]),
-                "filler_dim": int(artifact["filler_dim"]),
-                "use_bias": bool(artifact.get("use_bias", False)),
-                "exclude_center_squares": bool(
-                    artifact.get("config", {}).get("exclude_center_squares", False)
-                ),
-                "has_binding_to_residual": binding_to_residual is not None,
-            }
-            binding_maps_by_patch_layer[patch_layer] = binding_map
-            role_embeddings_by_patch_layer[patch_layer] = role_embeddings
-            filler_embeddings_by_patch_layer[patch_layer] = filler_embeddings
-            binding_to_residual_by_patch_layer[patch_layer] = None
-    else:
-        probe_source_layers = {patch_layer: patch_layer for patch_layer in patch_layers}
-        unique_probe_layers = sorted(set(probe_source_layers.values()))
-
-        binding_maps_by_source_layer = {}
-        role_embeddings_by_source_layer = {}
-        filler_embeddings_by_source_layer = {}
-        binding_to_residual_by_source_layer = {}
-        probe_paths_by_source_layer = {}
-        probe_configs_by_source_layer = {}
-        for source_layer in unique_probe_layers:
-            probe_path = resolve_tpr_probe_path(
-                layer=source_layer,
+        )
+        if not explicit_probe_pairs and loaded_layer != patch_layer:
+            raise ValueError(
+                f"Loaded TPR checkpoint layer {loaded_layer} from {probe_path}, "
+                f"expected layer {patch_layer}"
             )
-            (
-                binding_map,
-                role_embeddings,
-                filler_embeddings,
-                binding_to_residual,
-                loaded_layer,
-                artifact,
-            ) = load_tpr_factors(
-                probe_path,
-                d_model=d_model,
-                device=device,
-            )
-            if loaded_layer != source_layer:
-                raise ValueError(
-                    f"Loaded TPR checkpoint layer {loaded_layer} from {probe_path}, "
-                    f"expected layer {source_layer}"
-                )
-            binding_maps_by_source_layer[source_layer] = binding_map
-            role_embeddings_by_source_layer[source_layer] = role_embeddings
-            filler_embeddings_by_source_layer[source_layer] = filler_embeddings
-            binding_to_residual_by_source_layer[source_layer] = None
-            probe_paths_by_source_layer[source_layer] = str(probe_path)
-            probe_configs_by_source_layer[source_layer] = {
-                "layer": loaded_layer,
-                "role_dim": int(artifact["role_dim"]),
-                "filler_dim": int(artifact["filler_dim"]),
-                "use_bias": bool(artifact.get("use_bias", False)),
-                "exclude_center_squares": bool(
-                    artifact.get("config", {}).get("exclude_center_squares", False)
-                ),
-                "has_binding_to_residual": binding_to_residual is not None,
-            }
-
-        for patch_layer in patch_layers:
-            source_layer = probe_source_layers[patch_layer]
-            binding_maps_by_patch_layer[patch_layer] = binding_maps_by_source_layer[source_layer]
-            role_embeddings_by_patch_layer[patch_layer] = (
-                role_embeddings_by_source_layer[source_layer]
-            )
-            filler_embeddings_by_patch_layer[patch_layer] = (
-                filler_embeddings_by_source_layer[source_layer]
-            )
-            binding_to_residual_by_patch_layer[patch_layer] = (
-                binding_to_residual_by_source_layer[source_layer]
-            )
-            probe_paths_by_patch_layer[patch_layer] = probe_paths_by_source_layer[source_layer]
-            probe_configs_by_patch_layer[patch_layer] = (
-                probe_configs_by_source_layer[source_layer]
-            )
+        probe_source_layers[patch_layer] = loaded_layer
+        probe_paths_by_patch_layer[patch_layer] = str(probe_path)
+        binding_maps_by_patch_layer[patch_layer] = binding_map
+        role_embeddings_by_patch_layer[patch_layer] = role_embeddings
+        filler_embeddings_by_patch_layer[patch_layer] = filler_embeddings
 
     return (
         patch_layers,
         probe_source_layers,
         probe_paths_by_patch_layer,
-        probe_configs_by_patch_layer,
         binding_maps_by_patch_layer,
         role_embeddings_by_patch_layer,
         filler_embeddings_by_patch_layer,
-        binding_to_residual_by_patch_layer,
     )
 
 
@@ -954,29 +698,19 @@ class TPRInterventionConfig:
     num_intervened_squares: int = 1
     scale_values: tuple[float, ...] = DEFAULT_SCALE_VALUES
     scale: float | None = None
-    intervention_type: str = "flip"
+    intervention_type: str = "random"
     seed: int = 44
     verbose_limit: int = 5
-    require_reasonable_post_state: bool = False
-
-
-def resolve_square_weight_tuples_for_config(
-    config: TPRInterventionConfig,
-) -> list[tuple[float, ...]]:
-    return resolve_square_weight_tuples(
-        square_weight_values=FIXED_SQUARE_WEIGHT_VALUES,
-        num_intervened_squares=config.num_intervened_squares,
-    )
 
 
 def add_weight_summary_fields(
     summary: dict,
     *,
-    config: TPRInterventionConfig,
+    num_intervened_squares: int,
     square_weight_tuples: Sequence[Sequence[float]],
     best_square_weight_counts: Counter[tuple[float, ...]],
 ) -> None:
-    if config.num_intervened_squares == 1:
+    if num_intervened_squares == 1:
         return
 
     generic_counts = {
@@ -994,12 +728,12 @@ def add_weight_summary_fields(
     summary["square_weight_tuples"] = generic_tuples
     summary["num_square_weight_tuples"] = len(square_weight_tuples)
     summary["best_square_weight_selection"] = build_square_weight_selection_description(
-        config.num_intervened_squares
+        num_intervened_squares
     )
     summary["best_square_weight_counts"] = generic_counts
 
-    label = square_weight_label(config.num_intervened_squares)
-    plural_label = square_weight_plural_label(config.num_intervened_squares)
+    label = square_weight_label(num_intervened_squares)
+    plural_label = square_weight_plural_label(num_intervened_squares)
     summary[f"square_weight_{plural_label}"] = generic_tuples
     summary[f"num_square_weight_{plural_label}"] = len(square_weight_tuples)
     summary[f"best_square_weight_{label}_selection"] = summary[
@@ -1031,17 +765,18 @@ def run_interventions(config: TPRInterventionConfig) -> dict:
         patch_layers,
         probe_source_layers,
         probe_paths_by_patch_layer,
-        probe_configs_by_patch_layer,
         binding_maps_by_patch_layer,
         role_embeddings_by_patch_layer,
         filler_embeddings_by_patch_layer,
-        binding_to_residual_by_patch_layer,
     ) = resolve_tpr_resources_for_patch_layers(
-        config=config,
+        probe_pairs=config.probe_pairs,
         d_model=model.config.n_embd,
         device=device,
     )
     print(f"Forcing pseudoinverse residual projection for patch layers: {patch_layers}")
+    require_reasonable_post_state = default_require_reasonable_post_state(
+        config.num_intervened_squares
+    )
 
     benchmark = load_benchmark(
         config.benchmark_path,
@@ -1053,7 +788,7 @@ def run_interventions(config: TPRInterventionConfig) -> dict:
         num_intervened_squares=config.num_intervened_squares,
         require_valid_change=True,
         require_matching_valid_count=False,
-        require_reasonable_post_state=config.require_reasonable_post_state,
+        require_reasonable_post_state=require_reasonable_post_state,
     )
 
     false_positives = []
@@ -1061,7 +796,6 @@ def run_interventions(config: TPRInterventionConfig) -> dict:
     false_positives_null = []
     false_negatives_null = []
     exact_match_count = 0
-    null_exact_match_count = 0
     sample_best_results = []
     examples = []
     intervention_type_counts: Counter[str] = Counter()
@@ -1071,7 +805,10 @@ def run_interventions(config: TPRInterventionConfig) -> dict:
     skipped_unreasonable_post_states = 0
 
     scale_values = tuple(float(scale) for scale in config.scale_values)
-    square_weight_tuples = resolve_square_weight_tuples_for_config(config)
+    square_weight_tuples = resolve_square_weight_tuples(
+        square_weight_values=FIXED_SQUARE_WEIGHT_VALUES,
+        num_intervened_squares=config.num_intervened_squares,
+    )
 
     for sample in tqdm(
         benchmark,
@@ -1087,13 +824,15 @@ def run_interventions(config: TPRInterventionConfig) -> dict:
             num_intervened_squares=config.num_intervened_squares,
         )
         sample_intervention_type = str(sample.get("intervention_type", "flip"))
-        pre_valids, post_valids, is_reasonable = compute_pre_and_post_valids_for_squares(
-            completion=completion,
-            pos_ints=pos_ints,
-            ori_colors=ori_colors,
-            intervention_type=sample_intervention_type,
+        pre_valids, post_valids, is_reasonable = (
+            compute_pre_and_post_valids_for_squares(
+                completion=completion,
+                pos_ints=pos_ints,
+                ori_colors=ori_colors,
+                intervention_type=sample_intervention_type,
+            )
         )
-        if config.require_reasonable_post_state and not is_reasonable:
+        if require_reasonable_post_state and not is_reasonable:
             skipped_unreasonable_post_states += 1
             continue
         if not post_valids:
@@ -1114,7 +853,6 @@ def run_interventions(config: TPRInterventionConfig) -> dict:
 
         orig_snapshot = build_prediction_snapshot(
             ranked_board_positions_with_probabilities_from_logits(orig_logits),
-            prediction_mode=FIXED_PREDICTION_MODE,
             num_reference_moves=len(pre_valids),
             probability_threshold=FIXED_PREDICTION_PROBABILITY_THRESHOLD,
         )
@@ -1130,13 +868,10 @@ def run_interventions(config: TPRInterventionConfig) -> dict:
                     binding_maps_by_patch_layer[layer],
                     role_embeddings_by_patch_layer[layer],
                     filler_embeddings_by_patch_layer[layer],
-                    binding_to_residual=binding_to_residual_by_patch_layer[layer],
-                    completion=completion,
                     pos_ints=pos_ints,
                     ori_colors=ori_colors,
                     move_idx=len(completion),
                     intervention_type=sample_intervention_type,
-                    binding_construction_method=FIXED_BINDING_CONSTRUCTION_METHOD,
                     square_weights=square_weight_tuple,
                 )
                 for layer in patch_layers
@@ -1158,7 +893,6 @@ def run_interventions(config: TPRInterventionConfig) -> dict:
                     ranked_board_positions_with_probabilities_from_logits(
                         patched_logits
                     ),
-                    prediction_mode=FIXED_PREDICTION_MODE,
                     num_reference_moves=len(post_valids),
                     probability_threshold=FIXED_PREDICTION_PROBABILITY_THRESHOLD,
                 )
@@ -1199,7 +933,6 @@ def run_interventions(config: TPRInterventionConfig) -> dict:
         false_positives_null.append(len(fp_null))
         false_negatives_null.append(len(fn_null))
         exact_match_count += int(not fp and not fn)
-        null_exact_match_count += int(not fp_null and not fn_null)
         best_scale_counts[best_scale] += 1
         best_square_weight_counts[best_square_weights] += 1
 
@@ -1222,7 +955,9 @@ def run_interventions(config: TPRInterventionConfig) -> dict:
             "patched_topk_plus_extra_preds": patched_snapshot.topk_plus_extra_preds,
         }
         if config.num_intervened_squares > 1:
-            sample_result["best_square_weights"] = [float(weight) for weight in best_square_weights]
+            sample_result["best_square_weights"] = [
+                float(weight) for weight in best_square_weights
+            ]
             sample_result[
                 f"best_square_weight_{square_weight_label(config.num_intervened_squares)}"
             ] = [float(weight) for weight in best_square_weights]
@@ -1312,10 +1047,6 @@ def run_interventions(config: TPRInterventionConfig) -> dict:
         "exact_match_percentage": (
             100.0 * exact_match_count / len(errors) if errors else None
         ),
-        "null_exact_match_count": null_exact_match_count,
-        "null_exact_match_percentage": (
-            100.0 * null_exact_match_count / len(errors) if errors else None
-        ),
         "mean_error": float(np.mean(errors)) if errors else None,
         "mean_false_positive": (
             float(np.mean(false_positives)) if false_positives else None
@@ -1347,11 +1078,6 @@ def run_interventions(config: TPRInterventionConfig) -> dict:
         "patch_layers": list(patch_layers),
         "probe_source_layers": probe_source_layers,
         "probe_paths": probe_paths_by_patch_layer,
-        "binding_to_residual_sources": {
-            layer: "pseudoinverse_forced"
-            for layer in patch_layers
-        },
-        "probe_configs": probe_configs_by_patch_layer,
         "scale": config.scale,
         "requested_intervention_type": config.intervention_type,
         "resolved_intervention_type_counts": {
@@ -1363,7 +1089,7 @@ def run_interventions(config: TPRInterventionConfig) -> dict:
         "skipped_unchanged_valids": skipped_unchanged_valids,
         "examples": examples,
     }
-    if config.require_reasonable_post_state:
+    if require_reasonable_post_state:
         summary["post_state_reasonableness_filter"] = (
             "Keep only post-intervention board states with at least one legal move "
             "and a single 8-neighbor-connected occupied component."
@@ -1372,7 +1098,7 @@ def run_interventions(config: TPRInterventionConfig) -> dict:
 
     add_weight_summary_fields(
         summary,
-        config=config,
+        num_intervened_squares=config.num_intervened_squares,
         square_weight_tuples=square_weight_tuples,
         best_square_weight_counts=best_square_weight_counts,
     )
@@ -1499,23 +1225,20 @@ def main() -> None:
         data_path=args.data_path,
         probe_pairs=raw_probe_pairs,
         benchmark_path=args.benchmark_path,
-        output_path=args.output_path or default_output_path(args.num_intervened_squares),
+        output_path=args.output_path
+        or default_output_path(args.num_intervened_squares),
         device=args.device,
-        num_samples=args.num_samples or default_num_samples(args.num_intervened_squares),
+        num_samples=args.num_samples
+        or default_num_samples(args.num_intervened_squares),
         min_prefix_len=args.min_prefix_len,
         num_intervened_squares=args.num_intervened_squares,
         scale_values=(
-            (float(args.scale),)
-            if args.scale is not None
-            else default_scale_values(args.num_intervened_squares)
+            (float(args.scale),) if args.scale is not None else DEFAULT_SCALE_VALUES
         ),
         scale=args.scale,
         intervention_type=args.intervention_type,
         seed=args.seed,
         verbose_limit=args.verbose_limit,
-        require_reasonable_post_state=default_require_reasonable_post_state(
-            args.num_intervened_squares
-        ),
     )
     run_interventions(config)
 

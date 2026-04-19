@@ -1131,7 +1131,6 @@ def run_interventions(config: InterventionConfig) -> dict:
     false_positives_null = []
     false_negatives_null = []
     exact_match_count = 0
-    null_exact_match_count = 0
     sample_best_results = []
     examples = []
     intervention_type_counts: Counter[str] = Counter()
@@ -1231,7 +1230,6 @@ def run_interventions(config: InterventionConfig) -> dict:
         false_positives_null.append(len(fp_null))
         false_negatives_null.append(len(fn_null))
         exact_match_count += int(not fp and not fn)
-        null_exact_match_count += int(not fp_null and not fn_null)
         best_scale_combination_counts[best_scale_combination] += 1
 
         position_labels = [board_pos_to_label(pos_int) for pos_int in pos_ints]
@@ -1322,10 +1320,6 @@ def run_interventions(config: InterventionConfig) -> dict:
         "exact_match_count": exact_match_count,
         "exact_match_percentage": (
             100.0 * exact_match_count / len(errors) if errors else None
-        ),
-        "null_exact_match_count": null_exact_match_count,
-        "null_exact_match_percentage": (
-            100.0 * null_exact_match_count / len(errors) if errors else None
         ),
         "mean_error": float(np.mean(errors)) if errors else None,
         "mean_false_positive": (
