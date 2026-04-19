@@ -151,7 +151,7 @@ class MultilinearTPRProbeConfig:
     seed: int = 1111
     max_games: int | None = None
     max_layers: int | None = None
-    train_layers: str | None = "6"
+    train_layers: str | None = "5,6,7"
     row_dim: int = 8
     col_dim: int = 8
     color_dim: int = 4
