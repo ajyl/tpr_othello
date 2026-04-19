@@ -60,10 +60,11 @@ DIRECTIONS = (
     (0, -1),
     (-1, -1),
 )
-PATCH_TARGET_BY_NAME = {
-    "residual": "hook_resid_post",
-    "attention": "attn.hook_attn_out",
-}
+DEFAULT_PROBE_DIR = Path("probes/linear")
+DEFAULT_PATCH_LAYERS = (2, 3, 4, 5, 6, 7)
+FIXED_PATCH_TARGET_NAME = "residual"
+FIXED_PATCH_TARGET = "hook_resid_post"
+FIXED_PREDICTION_MODE = "probability_threshold"
 DEFAULT_PREDICTION_PROBABILITY_THRESHOLD = 1e-2
 TOPK_EXTRA_LOGGED_MOVES = 5
 SUPPORTED_INTERVENED_SQUARE_COUNTS = (1, 2, 3, 4)
@@ -343,10 +344,6 @@ def probe_patch_channels_for_square_color(
     return source_channel, target_channel
 
 
-def parse_layers(value: str) -> list[int]:
-    return [int(piece) for piece in value.split(",") if piece.strip()]
-
-
 def color_code_to_label(code: int) -> str:
     if int(code) not in COLOR_CODE_TO_LABEL:
         raise ValueError(f"Unsupported square color code: {code}")
@@ -550,10 +547,6 @@ def has_single_occupied_component(board: np.ndarray) -> bool:
 
 def filter_benchmark_samples(
     samples: Sequence[dict],
-    *,
-    require_valid_change: bool,
-    require_matching_valid_count: bool,
-    require_reasonable_post_state: bool,
 ) -> list[dict]:
     filtered = []
     for sample in samples:
@@ -563,11 +556,7 @@ def filter_benchmark_samples(
             ori_colors=sample["ori_colors"],
             intervention_type=sample.get("intervention_type", "flip"),
         )
-        if require_reasonable_post_state and not is_reasonable:
-            continue
-        if require_valid_change and pre_valids == post_valids:
-            continue
-        if require_matching_valid_count and len(pre_valids) != len(post_valids):
+        if not is_reasonable or pre_valids == post_valids:
             continue
         filtered.append(sample)
     return filtered
@@ -579,10 +568,7 @@ def generate_benchmark_from_data(
     min_prefix_len: int,
     seed: int,
     intervention_type: str = "flip",
-    require_valid_change: bool = True,
-    require_matching_valid_count: bool = True,
     num_intervened_squares: int = 1,
-    require_reasonable_post_state: bool = True,
 ) -> list[dict]:
     raw_games = load_pickle_sequences(data_path)
 
@@ -635,11 +621,7 @@ def generate_benchmark_from_data(
             ori_colors=ori_colors,
             intervention_type=resolved_intervention_type,
         )
-        if require_reasonable_post_state and not is_reasonable:
-            continue
-        if require_valid_change and pre_valids == post_valids:
-            continue
-        if require_matching_valid_count and len(pre_valids) != len(post_valids):
+        if not is_reasonable or pre_valids == post_valids:
             continue
 
         key = (
@@ -685,10 +667,7 @@ def load_benchmark(
     min_prefix_len: int,
     seed: int,
     intervention_type: str = "flip",
-    require_valid_change: bool = True,
-    require_matching_valid_count: bool = True,
     num_intervened_squares: int = 1,
-    require_reasonable_post_state: bool = True,
 ) -> list[dict]:
     if benchmark_path:
         raw_samples = load_benchmark_artifact(benchmark_path)
@@ -710,12 +689,7 @@ def load_benchmark(
             requested_intervention_type=intervention_type,
             seed=seed,
         )
-        return filter_benchmark_samples(
-            samples,
-            require_valid_change=require_valid_change,
-            require_matching_valid_count=require_matching_valid_count,
-            require_reasonable_post_state=require_reasonable_post_state,
-        )
+        return filter_benchmark_samples(samples)
 
     return generate_benchmark_from_data(
         data_path=data_path,
@@ -723,10 +697,7 @@ def load_benchmark(
         min_prefix_len=min_prefix_len,
         seed=seed,
         intervention_type=intervention_type,
-        require_valid_change=require_valid_change,
-        require_matching_valid_count=require_matching_valid_count,
         num_intervened_squares=num_intervened_squares,
-        require_reasonable_post_state=require_reasonable_post_state,
     )
 
 
@@ -787,15 +758,10 @@ def load_linear_probe_from_path(
 
 def resolve_linear_probe_resources_for_patch_layers(
     *,
-    config: "InterventionConfig",
+    probe_pairs: tuple[str, ...],
     device: torch.device,
 ) -> tuple[list[int], dict[int, int], dict[int, str], dict[int, torch.Tensor]]:
-    explicit_probe_pairs = parse_explicit_probe_pairs(config.probe_pairs)
-    if explicit_probe_pairs and config.probe_layer is not None:
-        raise ValueError(
-            "probe_layer cannot be combined with explicit probe pair mappings"
-        )
-
+    explicit_probe_pairs = parse_explicit_probe_pairs(probe_pairs)
     probe_source_layers: dict[int, int] = {}
     probe_paths_by_patch_layer: dict[int, str] = {}
     probes_by_patch_layer: dict[int, torch.Tensor] = {}
@@ -818,36 +784,21 @@ def resolve_linear_probe_resources_for_patch_layers(
             probes_by_patch_layer,
         )
 
-    patch_layers = parse_layers(config.patch_layers)
-    probe_source_layers = {
-        layer: (config.probe_layer if config.probe_layer is not None else layer)
-        for layer in patch_layers
-    }
-    unique_probe_layers = sorted(set(probe_source_layers.values()))
-    probes_by_source_layer = {}
-    probe_paths_by_source_layer = {}
-    for source_layer in unique_probe_layers:
-        probe_path = Path(config.probe_dir) / f"resid_{source_layer}_linear.pth"
+    patch_layers = list(DEFAULT_PATCH_LAYERS)
+    for layer in patch_layers:
+        probe_path = DEFAULT_PROBE_DIR / f"resid_{layer}_linear.pth"
         probe, loaded_layer = load_linear_probe_from_path(
             probe_path=probe_path,
             device=device,
         )
-        if loaded_layer != source_layer:
+        if loaded_layer != layer:
             raise ValueError(
                 f"Loaded linear probe layer {loaded_layer} from {probe_path}, "
-                f"expected layer {source_layer}"
+                f"expected layer {layer}"
             )
-        probes_by_source_layer[source_layer] = probe
-        probe_paths_by_source_layer[source_layer] = str(probe_path)
-
-    probes_by_patch_layer = {
-        layer: probes_by_source_layer[probe_source_layers[layer]]
-        for layer in patch_layers
-    }
-    probe_paths_by_patch_layer = {
-        layer: probe_paths_by_source_layer[probe_source_layers[layer]]
-        for layer in patch_layers
-    }
+        probe_source_layers[layer] = layer
+        probe_paths_by_patch_layer[layer] = str(probe_path)
+        probes_by_patch_layer[layer] = probe
     return (
         patch_layers,
         probe_source_layers,
@@ -915,28 +866,16 @@ def format_move_prediction_with_probability(move: int, probability: float) -> st
     return f"{board_pos_to_label(move)} ({probability:.4f})"
 
 
-def select_logged_and_eval_predictions(
+def select_threshold_predictions(
     ranked_with_probs: list[tuple[int, float]],
     *,
-    prediction_mode: str,
-    num_moves: int,
     probability_threshold: float,
-) -> tuple[list[int], list[tuple[int, float]]]:
-    if prediction_mode == "probability_threshold":
-        logged_preds = [
-            (move, probability)
-            for move, probability in ranked_with_probs
-            if probability > probability_threshold
-        ]
-        eval_preds = [move for move, _probability in logged_preds]
-        return eval_preds, logged_preds
-
-    if prediction_mode == "topk":
-        eval_preds = [move for move, _probability in ranked_with_probs[:num_moves]]
-        logged_preds = ranked_with_probs[: num_moves + TOPK_EXTRA_LOGGED_MOVES]
-        return eval_preds, logged_preds
-
-    raise ValueError(f"Unsupported prediction_mode: {prediction_mode}")
+) -> list[int]:
+    return [
+        move
+        for move, probability in ranked_with_probs
+        if probability > probability_threshold
+    ]
 
 
 def format_topk_predictions_alphanumerically(
@@ -960,6 +899,118 @@ def format_selected_predictions_alphanumerically(
         format_move_prediction_with_probability(move, probability_by_move[move])
         for move in sorted(selected_moves)
     ]
+
+
+@dataclass
+class PredictionSnapshot:
+    selected_moves: list[int]
+    probability_by_move: dict[int, float]
+    topk_preds: list[str]
+    topk_plus_extra_preds: list[str]
+    eval_preds: list[str]
+
+
+@dataclass
+class BestInterventionCandidate:
+    scale_combination: tuple[float, ...]
+    snapshot: PredictionSnapshot
+    false_positives: list[int]
+    false_negatives: list[int]
+    error: int
+
+
+def build_prediction_snapshot(
+    ranked_with_probs: list[tuple[int, float]],
+    *,
+    num_reference_moves: int,
+    probability_threshold: float,
+) -> PredictionSnapshot:
+    probability_by_move = dict(ranked_with_probs)
+    selected_moves = select_threshold_predictions(
+        ranked_with_probs,
+        probability_threshold=probability_threshold,
+    )
+    return PredictionSnapshot(
+        selected_moves=selected_moves,
+        probability_by_move=probability_by_move,
+        topk_preds=format_topk_predictions_alphanumerically(
+            ranked_with_probs,
+            num_moves=num_reference_moves,
+        ),
+        topk_plus_extra_preds=format_topk_predictions_alphanumerically(
+            ranked_with_probs,
+            num_moves=num_reference_moves + TOPK_EXTRA_LOGGED_MOVES,
+        ),
+        eval_preds=format_selected_predictions_alphanumerically(
+            selected_moves,
+            probability_by_move=probability_by_move,
+        ),
+    )
+
+
+def compute_prediction_error(
+    predicted_moves: Sequence[int],
+    target_moves: set[int],
+) -> tuple[list[int], list[int], int]:
+    false_positives = [move for move in predicted_moves if move not in target_moves]
+    false_negatives = [move for move in target_moves if move not in predicted_moves]
+    return (
+        false_positives,
+        false_negatives,
+        len(false_positives) + len(false_negatives),
+    )
+
+
+def find_best_intervention_candidate(
+    *,
+    model,
+    input_ids: torch.Tensor,
+    patch_layers: Sequence[int],
+    square_directions_by_patch_layer: dict[int, tuple[torch.Tensor, ...]],
+    post_valids: set[int],
+    scale_combinations: Sequence[tuple[float, ...]],
+    probability_threshold: float,
+) -> BestInterventionCandidate | None:
+    best_candidate = None
+    for scale_combination in scale_combinations:
+        overrides = {
+            f"blocks.{layer}.{FIXED_PATCH_TARGET}": make_additive_patch(
+                direction=combine_scaled_square_directions(
+                    square_directions_by_patch_layer[layer],
+                    scale_combination,
+                ),
+                scale=1.0,
+            )
+            for layer in patch_layers
+        }
+
+        with intervene(model, overrides):
+            with torch.inference_mode():
+                patched_logits, _ = model(input_ids)
+
+        snapshot = build_prediction_snapshot(
+            ranked_board_positions_with_probabilities_from_logits(patched_logits),
+            num_reference_moves=len(post_valids),
+            probability_threshold=probability_threshold,
+        )
+        false_positives, false_negatives, error = compute_prediction_error(
+            snapshot.selected_moves,
+            post_valids,
+        )
+        selection_key = (error, sum(scale_combination), *scale_combination)
+        if best_candidate is None or selection_key < (
+            best_candidate.error,
+            sum(best_candidate.scale_combination),
+            *best_candidate.scale_combination,
+        ):
+            best_candidate = BestInterventionCandidate(
+                scale_combination=scale_combination,
+                snapshot=snapshot,
+                false_positives=false_positives,
+                false_negatives=false_negatives,
+                error=error,
+            )
+    return best_candidate
 
 
 def make_additive_patch(direction: torch.Tensor, scale: float):
@@ -987,11 +1038,6 @@ def default_output_path(num_intervened_squares: int) -> str:
         f"linear_{SQUARE_COUNT_WORDS[num_intervened_squares]}_square_"
         "intervention_results.json"
     )
-
-
-def default_require_reasonable_post_state(num_intervened_squares: int) -> bool:
-    _ = num_intervened_squares
-    return True
 
 
 def square_count_phrase(num_intervened_squares: int) -> str:
@@ -1027,28 +1073,18 @@ def best_scale_summary_key(num_intervened_squares: int, *, counts: bool) -> str:
 class InterventionConfig:
     checkpoint: str = "ckpts/synthetic_model.pth"
     data_path: str = "test_data"
-    probe_dir: str = "probes/linear"
     probe_pairs: tuple[str, ...] = ()
     benchmark_path: str | None = None
     output_path: str = "intervention_results.json"
     device: str = "auto"
-    n_head: int = 8
-    probe_layer: int | None = None
-    patch_layers: str = "2,3,4,5,6,7"
-    num_samples: int = 128
+    num_samples: int = 1000
     min_prefix_len: int = 20
     num_intervened_squares: int = 1
     scale_values: tuple[float, ...] = DEFAULT_SCALE_VALUES
     scale: float | None = None
-    intervention_type: str = "flip"
+    intervention_type: str = "random"
     seed: int = 44
     verbose_limit: int = 5
-    require_valid_change: bool = True
-    require_matching_valid_count: bool = False
-    require_reasonable_post_state: bool = True
-    patch_target_name: str = "residual"
-    patch_target: str = PATCH_TARGET_BY_NAME["residual"]
-    prediction_mode: str = "probability_threshold"
     prediction_probability_threshold: float = DEFAULT_PREDICTION_PROBABILITY_THRESHOLD
 
 
@@ -1066,7 +1102,7 @@ def run_interventions(config: InterventionConfig) -> dict:
         {
             "model_path": config.checkpoint,
             "device": device,
-            "n_head": config.n_head,
+            "n_head": 8,
         }
     )
     convert_to_hooked_model(model)
@@ -1077,7 +1113,7 @@ def run_interventions(config: InterventionConfig) -> dict:
         probe_paths_by_patch_layer,
         probes_by_patch_layer,
     ) = resolve_linear_probe_resources_for_patch_layers(
-        config=config,
+        probe_pairs=config.probe_pairs,
         device=device,
     )
     benchmark = load_benchmark(
@@ -1087,10 +1123,7 @@ def run_interventions(config: InterventionConfig) -> dict:
         min_prefix_len=config.min_prefix_len,
         seed=config.seed,
         intervention_type=config.intervention_type,
-        require_valid_change=config.require_valid_change,
-        require_matching_valid_count=config.require_matching_valid_count,
         num_intervened_squares=config.num_intervened_squares,
-        require_reasonable_post_state=config.require_reasonable_post_state,
     )
 
     false_positives = []
@@ -1104,7 +1137,6 @@ def run_interventions(config: InterventionConfig) -> dict:
     intervention_type_counts: Counter[str] = Counter()
     best_scale_combination_counts: Counter[tuple[float, ...]] = Counter()
     skipped_unchanged_valids = 0
-    skipped_mismatched_valid_counts = 0
     skipped_unreasonable_post_states = 0
 
     scale_values = tuple(float(scale) for scale in config.scale_values)
@@ -1136,16 +1168,13 @@ def run_interventions(config: InterventionConfig) -> dict:
             ori_colors=ori_colors,
             intervention_type=sample_intervention_type,
         )
-        if config.require_reasonable_post_state and not is_reasonable:
+        if not is_reasonable:
             skipped_unreasonable_post_states += 1
             continue
         if not post_valids:
             continue
-        if config.require_valid_change and pre_valids == post_valids:
+        if pre_valids == post_valids:
             skipped_unchanged_valids += 1
-            continue
-        if config.require_matching_valid_count and len(pre_valids) != len(post_valids):
-            skipped_mismatched_valid_counts += 1
             continue
         intervention_type_counts[sample_intervention_type] += 1
 
@@ -1169,111 +1198,33 @@ def run_interventions(config: InterventionConfig) -> dict:
             for layer in patch_layers
         }
 
-        orig_ranked_with_probs = ranked_board_positions_with_probabilities_from_logits(
-            orig_logits
-        )
-        orig_preds, _orig_logged_preds = select_logged_and_eval_predictions(
-            orig_ranked_with_probs,
-            prediction_mode=config.prediction_mode,
-            num_moves=len(pre_valids),
+        orig_snapshot = build_prediction_snapshot(
+            ranked_board_positions_with_probabilities_from_logits(orig_logits),
+            num_reference_moves=len(pre_valids),
             probability_threshold=config.prediction_probability_threshold,
         )
-        orig_prob_by_move = dict(orig_ranked_with_probs)
-        formatted_orig_topk_preds = format_topk_predictions_alphanumerically(
-            orig_ranked_with_probs,
-            num_moves=len(pre_valids),
+        fp_null, fn_null, _null_error = compute_prediction_error(
+            orig_snapshot.selected_moves,
+            post_valids,
         )
-        formatted_orig_topk_plus_extra_preds = format_topk_predictions_alphanumerically(
-            orig_ranked_with_probs,
-            num_moves=len(pre_valids) + TOPK_EXTRA_LOGGED_MOVES,
+
+        best_candidate = find_best_intervention_candidate(
+            model=model,
+            input_ids=input_ids,
+            patch_layers=patch_layers,
+            square_directions_by_patch_layer=square_directions_by_patch_layer,
+            post_valids=post_valids,
+            scale_combinations=scale_combinations,
+            probability_threshold=config.prediction_probability_threshold,
         )
-        formatted_orig_eval_preds = format_selected_predictions_alphanumerically(
-            orig_preds,
-            probability_by_move=orig_prob_by_move,
-        )
-        fp_null = [move for move in orig_preds if move not in post_valids]
-        fn_null = [move for move in post_valids if move not in orig_preds]
-
-        best_candidate = None
-        for scale_combination in scale_combinations:
-            overrides = {
-                f"blocks.{layer}.{config.patch_target}": make_additive_patch(
-                    direction=combine_scaled_square_directions(
-                        square_directions_by_patch_layer[layer],
-                        scale_combination,
-                    ),
-                    scale=1.0,
-                )
-                for layer in patch_layers
-            }
-
-            with intervene(model, overrides):
-                with torch.inference_mode():
-                    patched_logits, _ = model(input_ids)
-
-            patched_ranked_with_probs = (
-                ranked_board_positions_with_probabilities_from_logits(patched_logits)
-            )
-            patched_preds, patched_logged_preds = select_logged_and_eval_predictions(
-                patched_ranked_with_probs,
-                prediction_mode=config.prediction_mode,
-                num_moves=len(post_valids),
-                probability_threshold=config.prediction_probability_threshold,
-            )
-            formatted_patched_topk_preds = format_topk_predictions_alphanumerically(
-                patched_ranked_with_probs,
-                num_moves=len(post_valids),
-            )
-            formatted_patched_topk_plus_extra_preds = (
-                format_topk_predictions_alphanumerically(
-                    patched_ranked_with_probs,
-                    num_moves=len(post_valids) + TOPK_EXTRA_LOGGED_MOVES,
-                )
-            )
-
-            fp = [move for move in patched_preds if move not in post_valids]
-            fn = [move for move in post_valids if move not in patched_preds]
-            error = len(fp) + len(fn)
-            selection_key = (
-                error,
-                sum(scale_combination),
-                *scale_combination,
-            )
-            if (
-                best_candidate is None
-                or selection_key < best_candidate["selection_key"]
-            ):
-                best_candidate = {
-                    "selection_key": selection_key,
-                    "scale_combination": scale_combination,
-                    "patched_preds": patched_preds,
-                    "patched_logged_preds": patched_logged_preds,
-                    "formatted_patched_topk_preds": formatted_patched_topk_preds,
-                    "formatted_patched_topk_plus_extra_preds": (
-                        formatted_patched_topk_plus_extra_preds
-                    ),
-                    "false_positives": fp,
-                    "false_negatives": fn,
-                    "error": error,
-                }
 
         if best_candidate is None:
             continue
 
-        patched_preds = best_candidate["patched_preds"]
-        patched_logged_preds = best_candidate["patched_logged_preds"]
-        formatted_patched_topk_preds = best_candidate["formatted_patched_topk_preds"]
-        formatted_patched_topk_plus_extra_preds = best_candidate[
-            "formatted_patched_topk_plus_extra_preds"
-        ]
-        fp = best_candidate["false_positives"]
-        fn = best_candidate["false_negatives"]
-        best_scale_combination = best_candidate["scale_combination"]
-        patched_prob_by_move = dict(patched_logged_preds)
-        formatted_patched_eval_preds = format_selected_predictions_alphanumerically(
-            patched_preds,
-            probability_by_move=patched_prob_by_move,
-        )
+        patched_snapshot = best_candidate.snapshot
+        fp = best_candidate.false_positives
+        fn = best_candidate.false_negatives
+        best_scale_combination = best_candidate.scale_combination
 
         false_positives.append(len(fp))
         false_negatives.append(len(fn))
@@ -1292,15 +1243,15 @@ def run_interventions(config: InterventionConfig) -> dict:
                 "intervention_type": sample_intervention_type,
                 "intervention_from_colors": from_color_labels,
                 "best_scales": list(best_scale_combination),
-                "best_error": best_candidate["error"],
+                "best_error": best_candidate.error,
                 "best_false_positive": len(fp),
                 "best_false_negative": len(fn),
-                "orig_preds": formatted_orig_eval_preds,
-                "patched_preds": formatted_patched_eval_preds,
-                "orig_topk_preds": formatted_orig_topk_preds,
-                "patched_topk_preds": formatted_patched_topk_preds,
-                "orig_topk_plus_extra_preds": formatted_orig_topk_plus_extra_preds,
-                "patched_topk_plus_extra_preds": formatted_patched_topk_plus_extra_preds,
+                "orig_preds": orig_snapshot.eval_preds,
+                "patched_preds": patched_snapshot.eval_preds,
+                "orig_topk_preds": orig_snapshot.topk_preds,
+                "patched_topk_preds": patched_snapshot.topk_preds,
+                "orig_topk_plus_extra_preds": orig_snapshot.topk_plus_extra_preds,
+                "patched_topk_plus_extra_preds": patched_snapshot.topk_plus_extra_preds,
             }
         )
 
@@ -1311,21 +1262,11 @@ def run_interventions(config: InterventionConfig) -> dict:
             sorted_post_valids = sort_move_labels(
                 [board_pos_to_label(move) for move in post_valids]
             )
-            formatted_orig_example_preds = format_selected_predictions_alphanumerically(
-                orig_preds,
-                probability_by_move=orig_prob_by_move,
-            )
-            formatted_patched_example_preds = (
-                format_selected_predictions_alphanumerically(
-                    patched_preds,
-                    probability_by_move=patched_prob_by_move,
-                )
-            )
             comparison_table = format_move_comparison_table(
                 {
-                    "orig_preds": formatted_orig_example_preds,
+                    "orig_preds": orig_snapshot.eval_preds,
                     "pre_valids": sorted_pre_valids,
-                    "patched_preds": formatted_patched_example_preds,
+                    "patched_preds": patched_snapshot.eval_preds,
                     "post_valids": sorted_post_valids,
                 }
             )
@@ -1336,17 +1277,17 @@ def run_interventions(config: InterventionConfig) -> dict:
                     "intervention_type": sample_intervention_type,
                     "intervention_from_colors": from_color_labels,
                     "best_scales": list(best_scale_combination),
-                    "best_error": best_candidate["error"],
+                    "best_error": best_candidate.error,
                     "pre_valids": sorted_pre_valids,
                     "post_valids": sorted_post_valids,
-                    "orig_preds": formatted_orig_example_preds,
-                    "patched_preds": formatted_patched_example_preds,
-                    "orig_topk_preds": formatted_orig_topk_preds,
-                    "patched_topk_preds": formatted_patched_topk_preds,
-                    "orig_topk_plus_extra_preds": formatted_orig_topk_plus_extra_preds,
-                    "patched_topk_plus_extra_preds": formatted_patched_topk_plus_extra_preds,
-                    "orig_eval_preds": formatted_orig_eval_preds,
-                    "patched_eval_preds": formatted_patched_eval_preds,
+                    "orig_preds": orig_snapshot.eval_preds,
+                    "patched_preds": patched_snapshot.eval_preds,
+                    "orig_topk_preds": orig_snapshot.topk_preds,
+                    "patched_topk_preds": patched_snapshot.topk_preds,
+                    "orig_topk_plus_extra_preds": orig_snapshot.topk_plus_extra_preds,
+                    "patched_topk_plus_extra_preds": patched_snapshot.topk_plus_extra_preds,
+                    "orig_eval_preds": orig_snapshot.eval_preds,
+                    "patched_eval_preds": patched_snapshot.eval_preds,
                     "comparison_table": comparison_table,
                 }
             )
@@ -1374,9 +1315,9 @@ def run_interventions(config: InterventionConfig) -> dict:
             f"{SQUARE_COUNT_WORDS[config.num_intervened_squares]}_square_linear_target_sum"
         ),
         "num_intervened_squares": config.num_intervened_squares,
-        "intervention_space": config.patch_target_name,
-        "patch_target_name": config.patch_target_name,
-        "patch_target": config.patch_target,
+        "intervention_space": FIXED_PATCH_TARGET_NAME,
+        "patch_target_name": FIXED_PATCH_TARGET_NAME,
+        "patch_target": FIXED_PATCH_TARGET,
         "num_samples": len(errors),
         "exact_match_count": exact_match_count,
         "exact_match_percentage": (
@@ -1400,7 +1341,7 @@ def run_interventions(config: InterventionConfig) -> dict:
         "mean_null_false_negative": (
             float(np.mean(false_negatives_null)) if false_negatives_null else None
         ),
-        "prediction_mode": config.prediction_mode,
+        "prediction_mode": FIXED_PREDICTION_MODE,
         "prediction_probability_threshold": config.prediction_probability_threshold,
         "prediction_probability_threshold_percent": (
             100.0 * config.prediction_probability_threshold
@@ -1411,7 +1352,6 @@ def run_interventions(config: InterventionConfig) -> dict:
         "best_scale_combination_selection": scale_selection_description,
         "best_scale_combination_counts": scale_summary,
         "patch_layers": patch_layers,
-        "probe_layer": config.probe_layer,
         "probe_source_layers": probe_source_layers,
         "probe_paths": probe_paths_by_patch_layer,
         "scale": config.scale,
@@ -1423,13 +1363,10 @@ def run_interventions(config: InterventionConfig) -> dict:
         },
         "sample_best_results": sample_best_results,
         "skipped_unchanged_valids": skipped_unchanged_valids,
-        "skipped_mismatched_valid_counts": skipped_mismatched_valid_counts,
         "skipped_unreasonable_post_states": skipped_unreasonable_post_states,
         "post_state_reasonableness_filter": (
             "Keep only post-intervention board states with at least one legal move "
             "and a single 8-neighbor-connected occupied component."
-            if config.require_reasonable_post_state
-            else None
         ),
         "examples": examples,
     }
@@ -1558,15 +1495,7 @@ def main() -> None:
         )
 
     raw_probe_pairs = tuple(args.probe_pair or ())
-
     num_intervened_squares = int(args.num_intervened_squares)
-    patch_layers = (
-        ",".join(
-            str(layer) for layer in sorted(parse_explicit_probe_pairs(raw_probe_pairs))
-        )
-        if raw_probe_pairs
-        else InterventionConfig.patch_layers
-    )
 
     config = InterventionConfig(
         checkpoint=args.checkpoint,
@@ -1575,7 +1504,6 @@ def main() -> None:
         benchmark_path=args.benchmark_path,
         output_path=args.output_path or default_output_path(num_intervened_squares),
         device=args.device,
-        patch_layers=patch_layers,
         num_samples=(
             int(args.num_samples)
             if args.num_samples is not None
@@ -1592,9 +1520,6 @@ def main() -> None:
         intervention_type=args.intervention_type,
         seed=args.seed,
         verbose_limit=args.verbose_limit,
-        require_reasonable_post_state=default_require_reasonable_post_state(
-            num_intervened_squares
-        ),
         prediction_probability_threshold=args.prediction_probability_threshold,
     )
     run_interventions(config)
