@@ -1,4 +1,4 @@
-"""Run configurable 1-4 square multilinear TPR interventions on Othello GPT."""
+"""Run multilinear TPR interventions on Othello GPT."""
 
 from __future__ import annotations
 
@@ -25,9 +25,6 @@ from hook_utils.record_utils import convert_to_hooked_model  # noqa: E402
 from hook_utils.util_funcs import seed_all  # noqa: E402
 from intervene_probe import (  # noqa: E402
     ACTUAL_INTERVENTION_TYPE_CHOICES,
-    INTERVENTION_TYPE_CHOICES,
-    OthelloBoardState,
-    apply_interventions_to_board_state,
     board_pos_to_label,
     color_code_to_label,
     compute_pre_and_post_valids_for_squares,
@@ -56,30 +53,15 @@ from intervene_tpr_probe import (  # noqa: E402
     square_weight_plural_label,
 )
 from intervene_multilinear_tpr_probe_utils import (  # noqa: E402
-    apply_multilinear_probe_adjoint_to_binding_delta,
     build_multilinear_binding_delta_as_sum_of_outer_products,
     build_multilinear_binding_space_constraints,
-    build_multilinear_binding_tensor_from_board_state,
     resolve_multilinear_resources_for_patch_layers,
     shard_benchmark_samples,
-    solve_multilinear_binding_delta_for_selected_squares,
     solve_residual_delta_for_binding_delta,
 )
 
 
 SUPPORTED_INTERVENED_SQUARE_COUNTS = (1, 2, 3, 4)
-PATCH_TARGET_BY_NAME = {
-    "attention": "attn.hook_attn_out",
-    "residual": "hook_resid_post",
-}
-PREDICTION_MODE_CHOICES = ("topk", "probability_threshold")
-RESIDUAL_PROJECTION_CHOICES = ("auto", "learned", "pinv")
-BINDING_CONSTRUCTION_METHOD_CHOICES = (
-    "adjoint_outer_products",
-    "outer_products",
-    "solve",
-    "full_rebuild",
-)
 FIXED_PATCH_LAYERS = (2, 3, 4, 5, 6, 7)
 FIXED_PROBE_DIR = "probes/tpr_multilinear"
 FIXED_N_HEAD = 8
@@ -90,6 +72,13 @@ FIXED_USE_BIAS = False
 FIXED_EXCLUDE_CENTER_SQUARES = False
 FIXED_PREDICTION_PROBABILITY_THRESHOLD = 1e-2
 FIXED_SQUARE_WEIGHT_VALUES = DEFAULT_SCALE_VALUES
+FIXED_INTERVENTION_TYPE = "random"
+FIXED_BINDING_CONSTRUCTION_METHOD = "outer_products"
+FIXED_PATCH_TARGET_NAME = "residual"
+FIXED_PATCH_TARGET = "hook_resid_post"
+FIXED_RESIDUAL_PROJECTION = "pinv"
+FIXED_PREDICTION_MODE = "probability_threshold"
+FIXED_REQUIRE_MATCHING_VALID_COUNT = False
 
 
 def default_output_path(num_intervened_squares: int) -> str:
@@ -101,74 +90,8 @@ def default_output_path(num_intervened_squares: int) -> str:
     )
 
 
-def default_binding_construction_method(num_intervened_squares: int) -> str:
-    return "adjoint_outer_products" if num_intervened_squares == 1 else "solve"
-
-
-def default_patch_target_name(num_intervened_squares: int) -> str:
-    return "attention" if num_intervened_squares == 1 else "residual"
-
-
-def default_prediction_mode(num_intervened_squares: int) -> str:
-    return "topk" if num_intervened_squares == 1 else "probability_threshold"
-
-
 def default_require_reasonable_post_state(num_intervened_squares: int) -> bool:
     return num_intervened_squares >= 3
-
-
-def build_pre_and_post_board_states_for_squares(
-    completion: Sequence[int],
-    *,
-    pos_ints: Sequence[int],
-    ori_colors: Sequence[int],
-    intervention_type: str,
-) -> tuple[OthelloBoardState, OthelloBoardState]:
-    board_state = OthelloBoardState()
-    for move in completion:
-        board_state.umpire(int(move))
-    modified_board = board_state.copy()
-    apply_interventions_to_board_state(
-        modified_board,
-        pos_ints=pos_ints,
-        ori_colors=ori_colors,
-        intervention_type=intervention_type,
-    )
-    return board_state, modified_board
-
-
-def build_binding_delta_from_full_board_reconstruction(
-    row_embeddings: torch.Tensor,
-    col_embeddings: torch.Tensor,
-    color_embeddings: torch.Tensor,
-    *,
-    completion: Sequence[int],
-    pos_ints: Sequence[int],
-    ori_colors: Sequence[int],
-    move_idx: int,
-    intervention_type: str,
-) -> torch.Tensor:
-    original_board, modified_board = build_pre_and_post_board_states_for_squares(
-        completion,
-        pos_ints=pos_ints,
-        ori_colors=ori_colors,
-        intervention_type=intervention_type,
-    )
-    original_binding = build_multilinear_binding_tensor_from_board_state(
-        row_embeddings=row_embeddings,
-        col_embeddings=col_embeddings,
-        color_embeddings=color_embeddings,
-        board_state=original_board.state,
-        move_idx=move_idx,
-    )
-    target_binding = build_multilinear_binding_tensor_from_board_state(
-        row_embeddings=row_embeddings,
-        col_embeddings=col_embeddings,
-        color_embeddings=color_embeddings,
-        board_state=modified_board.state,
-        move_idx=move_idx,
-    )
-    return target_binding - original_binding
 
 
 def multilinear_patch_direction_for_squares(
@@ -176,14 +99,11 @@ def multilinear_patch_direction_for_squares(
     row_embeddings: torch.Tensor,
     col_embeddings: torch.Tensor,
     color_embeddings: torch.Tensor,
-    binding_to_residual: dict | None,
     *,
-    completion: Sequence[int],
     pos_ints: Sequence[int],
     ori_colors: Sequence[int],
     move_idx: int,
     intervention_type: str,
-    binding_construction_method: str,
     square_weights: Sequence[float],
 ) -> torch.Tensor:
     selected_spatial_features, selected_color_deltas = (
@@ -201,49 +121,16 @@ def multilinear_patch_direction_for_squares(
         [float(weight) for weight in square_weights]
     ).unsqueeze(-1) * selected_color_deltas
 
-    if binding_construction_method == "solve":
-        delta_binding = solve_multilinear_binding_delta_for_selected_squares(
-            selected_spatial_features=selected_spatial_features,
-            selected_color_deltas=weighted_color_deltas,
-            row_dim=row_embeddings.shape[-1],
-            col_dim=col_embeddings.shape[-1],
-        )
-    elif binding_construction_method in {"outer_products", "adjoint_outer_products"}:
-        delta_binding = build_multilinear_binding_delta_as_sum_of_outer_products(
-            selected_spatial_features=selected_spatial_features,
-            selected_color_deltas=weighted_color_deltas,
-            row_dim=row_embeddings.shape[-1],
-            col_dim=col_embeddings.shape[-1],
-        )
-    elif binding_construction_method == "full_rebuild":
-        delta_binding = build_binding_delta_from_full_board_reconstruction(
-            row_embeddings=row_embeddings,
-            col_embeddings=col_embeddings,
-            color_embeddings=color_embeddings,
-            completion=completion,
-            pos_ints=pos_ints,
-            ori_colors=ori_colors,
-            move_idx=move_idx,
-            intervention_type=intervention_type,
-        )
-    else:
-        raise ValueError(
-            "Unknown binding construction method "
-            f"{binding_construction_method!r}; expected one of "
-            f"{BINDING_CONSTRUCTION_METHOD_CHOICES}"
-        )
-
-    if binding_construction_method == "adjoint_outer_products":
-        direction = apply_multilinear_probe_adjoint_to_binding_delta(
-            binding_map=binding_map,
-            delta_binding=delta_binding,
-        )
-    else:
-        direction = solve_residual_delta_for_binding_delta(
-            binding_map=binding_map,
-            delta_binding=delta_binding,
-            binding_to_residual=binding_to_residual,
-        )
+    delta_binding = build_multilinear_binding_delta_as_sum_of_outer_products(
+        selected_spatial_features=selected_spatial_features,
+        selected_color_deltas=weighted_color_deltas,
+        row_dim=row_embeddings.shape[-1],
+        col_dim=col_embeddings.shape[-1],
+    )
+    direction = solve_residual_delta_for_binding_delta(
+        binding_map=binding_map,
+        delta_binding=delta_binding,
+    )
     return direction / direction.norm().clamp_min(1e-12)
 
 
@@ -260,23 +147,14 @@ def build_prediction_snapshot(
     ranked_with_probs: list[tuple[int, float]],
     *,
     num_reference_moves: int,
-    prediction_mode: str,
     probability_threshold: float,
 ) -> PredictionSnapshot:
     probability_by_move = dict(ranked_with_probs)
-    if prediction_mode == "topk":
-        selected_moves = [move for move, _prob in ranked_with_probs[:num_reference_moves]]
-    elif prediction_mode == "probability_threshold":
-        selected_moves = [
-            move
-            for move, probability in ranked_with_probs
-            if probability > probability_threshold
-        ]
-    else:
-        raise ValueError(
-            f"Unsupported prediction mode {prediction_mode!r}; expected one of "
-            f"{PREDICTION_MODE_CHOICES}"
-        )
+    selected_moves = [
+        move
+        for move, probability in ranked_with_probs
+        if probability > probability_threshold
+    ]
 
     return PredictionSnapshot(
         selected_moves=selected_moves,
@@ -320,16 +198,16 @@ class MultilinearTPRInterventionConfig:
     num_intervened_squares: int = 1
     scale_values: tuple[float, ...] = DEFAULT_SCALE_VALUES
     scale: float | None = None
-    intervention_type: str = "flip"
+    intervention_type: str = FIXED_INTERVENTION_TYPE
     seed: int = 44
     verbose_limit: int = 5
-    require_matching_valid_count: bool = True
+    require_matching_valid_count: bool = FIXED_REQUIRE_MATCHING_VALID_COUNT
     require_reasonable_post_state: bool = False
-    binding_construction_method: str = "adjoint_outer_products"
-    patch_target_name: str = "attention"
-    patch_target: str = PATCH_TARGET_BY_NAME["attention"]
-    residual_projection: str = "auto"
-    prediction_mode: str = "topk"
+    binding_construction_method: str = FIXED_BINDING_CONSTRUCTION_METHOD
+    patch_target_name: str = FIXED_PATCH_TARGET_NAME
+    patch_target: str = FIXED_PATCH_TARGET
+    residual_projection: str = FIXED_RESIDUAL_PROJECTION
+    prediction_mode: str = FIXED_PREDICTION_MODE
     num_benchmark_shards: int = 1
     benchmark_shard_index: int = 0
 
@@ -376,49 +254,26 @@ def add_weight_summary_fields(
     summary[f"best_square_weight_{label}_counts"] = generic_counts
 
 
-def binding_to_residual_source_label(
-    *,
-    binding_construction_method: str,
-    residual_projection: str,
-    binding_to_residual: dict | None,
-) -> str:
-    if binding_construction_method == "adjoint_outer_products":
-        return "not_used"
-    if residual_projection == "pinv":
-        return "pseudoinverse_forced"
-    if binding_to_residual is not None:
-        return "learned_linear_map"
-    return "pseudoinverse_fallback"
-
-
 def validate_config(config: MultilinearTPRInterventionConfig) -> None:
     if config.num_intervened_squares not in SUPPORTED_INTERVENED_SQUARE_COUNTS:
         raise ValueError(
             "--num-intervened-squares must be one of "
             f"{SUPPORTED_INTERVENED_SQUARE_COUNTS}"
         )
-    if config.patch_target_name not in PATCH_TARGET_BY_NAME:
-        raise ValueError(
-            f"Unsupported patch target {config.patch_target_name!r}; expected one of "
-            f"{tuple(PATCH_TARGET_BY_NAME)}"
-        )
-    if config.prediction_mode not in PREDICTION_MODE_CHOICES:
-        raise ValueError(
-            f"Unsupported prediction mode {config.prediction_mode!r}; expected one of "
-            f"{PREDICTION_MODE_CHOICES}"
-        )
-    if config.residual_projection not in RESIDUAL_PROJECTION_CHOICES:
-        raise ValueError(
-            "Unsupported residual projection "
-            f"{config.residual_projection!r}; expected one of "
-            f"{RESIDUAL_PROJECTION_CHOICES}"
-        )
-    if config.binding_construction_method not in BINDING_CONSTRUCTION_METHOD_CHOICES:
-        raise ValueError(
-            "Unsupported binding construction method "
-            f"{config.binding_construction_method!r}; expected one of "
-            f"{BINDING_CONSTRUCTION_METHOD_CHOICES}"
-        )
+    for field_name, expected in (
+        ("intervention_type", FIXED_INTERVENTION_TYPE),
+        ("require_matching_valid_count", FIXED_REQUIRE_MATCHING_VALID_COUNT),
+        ("binding_construction_method", FIXED_BINDING_CONSTRUCTION_METHOD),
+        ("patch_target_name", FIXED_PATCH_TARGET_NAME),
+        ("patch_target", FIXED_PATCH_TARGET),
+        ("residual_projection", FIXED_RESIDUAL_PROJECTION),
+        ("prediction_mode", FIXED_PREDICTION_MODE),
+    ):
+        actual = getattr(config, field_name)
+        if actual != expected:
+            raise ValueError(
+                f"{field_name} is fixed to {expected!r} in this script; got {actual!r}"
+            )
 
 
 def run_interventions(config: MultilinearTPRInterventionConfig) -> dict:
@@ -450,7 +305,6 @@ def run_interventions(config: MultilinearTPRInterventionConfig) -> dict:
         row_embeddings_by_patch_layer,
         col_embeddings_by_patch_layer,
         color_embeddings_by_patch_layer,
-        binding_to_residual_by_patch_layer,
     ) = resolve_multilinear_resources_for_patch_layers(
         probe_pairs=config.probe_pairs,
         probe_seed=config.probe_seed,
@@ -461,34 +315,9 @@ def run_interventions(config: MultilinearTPRInterventionConfig) -> dict:
         color_dim=FIXED_COLOR_DIM,
         use_bias=FIXED_USE_BIAS,
         exclude_center_squares=FIXED_EXCLUDE_CENTER_SQUARES,
-        residual_projection=config.residual_projection,
-        binding_construction_method=config.binding_construction_method,
         d_model=model.config.n_embd,
         device=device,
     )
-
-    uses_residual_projection = (
-        config.binding_construction_method != "adjoint_outer_products"
-    )
-    missing_binding_to_residual_layers = [
-        layer
-        for layer in patch_layers
-        if binding_to_residual_by_patch_layer[layer] is None
-    ]
-    if (
-        uses_residual_projection
-        and config.residual_projection == "auto"
-        and missing_binding_to_residual_layers
-    ):
-        print(
-            "Falling back to pseudoinverse for patch layers without a saved "
-            f"binding->residual map: {missing_binding_to_residual_layers}"
-        )
-    elif uses_residual_projection and config.residual_projection == "pinv":
-        print(
-            "Forcing pseudoinverse residual projection for patch layers: "
-            f"{patch_layers}"
-        )
 
     benchmark = load_benchmark(
         config.benchmark_path,
@@ -519,7 +348,6 @@ def run_interventions(config: MultilinearTPRInterventionConfig) -> dict:
     best_scale_counts: Counter[float] = Counter()
     best_square_weight_counts: Counter[tuple[float, ...]] = Counter()
     skipped_unchanged_valids = 0
-    skipped_mismatched_valid_counts = 0
     skipped_unreasonable_post_states = 0
 
     scale_values = tuple(float(scale) for scale in config.scale_values)
@@ -558,12 +386,6 @@ def run_interventions(config: MultilinearTPRInterventionConfig) -> dict:
         if pre_valids == post_valids:
             skipped_unchanged_valids += 1
             continue
-        if (
-            config.require_matching_valid_count
-            and len(pre_valids) != len(post_valids)
-        ):
-            skipped_mismatched_valid_counts += 1
-            continue
         intervention_type_counts[sample_intervention_type] += 1
 
         input_ids = torch.tensor(
@@ -578,7 +400,6 @@ def run_interventions(config: MultilinearTPRInterventionConfig) -> dict:
         orig_snapshot = build_prediction_snapshot(
             ranked_board_positions_with_probabilities_from_logits(orig_logits),
             num_reference_moves=len(pre_valids),
-            prediction_mode=config.prediction_mode,
             probability_threshold=FIXED_PREDICTION_PROBABILITY_THRESHOLD,
         )
         fp_null, fn_null, _null_error = compute_prediction_error(
@@ -594,13 +415,10 @@ def run_interventions(config: MultilinearTPRInterventionConfig) -> dict:
                     row_embeddings=row_embeddings_by_patch_layer[layer],
                     col_embeddings=col_embeddings_by_patch_layer[layer],
                     color_embeddings=color_embeddings_by_patch_layer[layer],
-                    binding_to_residual=binding_to_residual_by_patch_layer[layer],
-                    completion=completion,
                     pos_ints=pos_ints,
                     ori_colors=ori_colors,
                     move_idx=len(completion),
                     intervention_type=sample_intervention_type,
-                    binding_construction_method=config.binding_construction_method,
                     square_weights=square_weight_tuple,
                 )
                 for layer in patch_layers
@@ -624,7 +442,6 @@ def run_interventions(config: MultilinearTPRInterventionConfig) -> dict:
                         patched_logits
                     ),
                     num_reference_moves=len(post_valids),
-                    prediction_mode=config.prediction_mode,
                     probability_threshold=FIXED_PREDICTION_PROBABILITY_THRESHOLD,
                 )
                 fp, fn, error = compute_prediction_error(
@@ -760,7 +577,7 @@ def run_interventions(config: MultilinearTPRInterventionConfig) -> dict:
         if config.num_intervened_squares == 1
         else (
             f"{SQUARE_COUNT_WORDS[config.num_intervened_squares]}_square_binding_"
-            f"{config.binding_construction_method}"
+            f"{FIXED_BINDING_CONSTRUCTION_METHOD}"
         )
     )
     summary = {
@@ -811,12 +628,7 @@ def run_interventions(config: MultilinearTPRInterventionConfig) -> dict:
         "probe_source_layers": probe_source_layers,
         "probe_paths": probe_paths_by_patch_layer,
         "binding_to_residual_sources": {
-            layer: binding_to_residual_source_label(
-                binding_construction_method=config.binding_construction_method,
-                residual_projection=config.residual_projection,
-                binding_to_residual=binding_to_residual_by_patch_layer[layer],
-            )
-            for layer in patch_layers
+            layer: "pseudoinverse_forced" for layer in patch_layers
         },
         "probe_configs": probe_configs_by_patch_layer,
         "row_dim": FIXED_ROW_DIM,
@@ -833,7 +645,7 @@ def run_interventions(config: MultilinearTPRInterventionConfig) -> dict:
         },
         "sample_best_results": sample_best_results,
         "skipped_unchanged_valids": skipped_unchanged_valids,
-        "skipped_mismatched_valid_counts": skipped_mismatched_valid_counts,
+        "skipped_mismatched_valid_counts": 0,
         "examples": examples,
         "num_benchmark_shards": config.num_benchmark_shards,
         "benchmark_shard_index": config.benchmark_shard_index,
@@ -951,55 +763,11 @@ def build_parser() -> argparse.ArgumentParser:
             "for the selected square count."
         ),
     )
-    parser.add_argument(
-        "--intervention-type",
-        choices=INTERVENTION_TYPE_CHOICES,
-        default=MultilinearTPRInterventionConfig.intervention_type,
-        help=(
-            "Which board edit to emulate at the selected squares: `flip`, `empty`, "
-            "or `random` to choose between them independently for each sample "
-            "using --seed."
-        ),
-    )
-    parser.add_argument(
-        "--binding-construction-method",
-        choices=BINDING_CONSTRUCTION_METHOD_CHOICES,
-        default=None,
-        help="Defaults depend on --num-intervened-squares.",
-    )
-    parser.add_argument(
-        "--patch-target",
-        choices=tuple(PATCH_TARGET_BY_NAME),
-        default=None,
-        help="Defaults depend on --num-intervened-squares.",
-    )
-    parser.add_argument(
-        "--residual-projection",
-        choices=RESIDUAL_PROJECTION_CHOICES,
-        default=MultilinearTPRInterventionConfig.residual_projection,
-        help=(
-            "How to map non-adjoint binding edits back into model space: "
-            "`auto` uses a saved learned map when present and otherwise falls "
-            "back to a pseudoinverse, `learned` requires the saved map, and "
-            "`pinv` forces the pseudoinverse."
-        ),
-    )
-    parser.add_argument(
-        "--prediction-mode",
-        choices=PREDICTION_MODE_CHOICES,
-        default=None,
-        help="Defaults depend on --num-intervened-squares.",
-    )
     parser.add_argument("--seed", type=int, default=MultilinearTPRInterventionConfig.seed)
     parser.add_argument(
         "--verbose-limit",
         type=int,
         default=MultilinearTPRInterventionConfig.verbose_limit,
-    )
-    parser.add_argument(
-        "--allow-mismatched-valid-counts",
-        action="store_true",
-        help="Keep intervention samples even when len(pre_valids) != len(post_valids).",
     )
     parser.add_argument(
         "--num-benchmark-shards",
@@ -1022,12 +790,6 @@ def main() -> None:
     raw_probe_pairs = tuple(args.probe_pair or ())
 
     num_intervened_squares = args.num_intervened_squares
-    patch_target_name = args.patch_target or default_patch_target_name(
-        num_intervened_squares
-    )
-    prediction_mode = args.prediction_mode or default_prediction_mode(
-        num_intervened_squares
-    )
     config = MultilinearTPRInterventionConfig(
         checkpoint=args.checkpoint,
         data_path=args.data_path,
@@ -1043,21 +805,18 @@ def main() -> None:
             (float(args.scale),) if args.scale is not None else DEFAULT_SCALE_VALUES
         ),
         scale=args.scale,
-        intervention_type=args.intervention_type,
+        intervention_type=FIXED_INTERVENTION_TYPE,
         seed=args.seed,
         verbose_limit=args.verbose_limit,
-        require_matching_valid_count=not args.allow_mismatched_valid_counts,
+        require_matching_valid_count=FIXED_REQUIRE_MATCHING_VALID_COUNT,
         require_reasonable_post_state=default_require_reasonable_post_state(
             num_intervened_squares
         ),
-        binding_construction_method=(
-            args.binding_construction_method
-            or default_binding_construction_method(num_intervened_squares)
-        ),
-        patch_target_name=patch_target_name,
-        patch_target=PATCH_TARGET_BY_NAME[patch_target_name],
-        residual_projection=args.residual_projection,
-        prediction_mode=prediction_mode,
+        binding_construction_method=FIXED_BINDING_CONSTRUCTION_METHOD,
+        patch_target_name=FIXED_PATCH_TARGET_NAME,
+        patch_target=FIXED_PATCH_TARGET,
+        residual_projection=FIXED_RESIDUAL_PROJECTION,
+        prediction_mode=FIXED_PREDICTION_MODE,
         num_benchmark_shards=args.num_benchmark_shards,
         benchmark_shard_index=args.benchmark_shard_index,
     )

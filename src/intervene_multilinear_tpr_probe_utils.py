@@ -5,35 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Sequence
 
-import numpy as np
 import torch
 
-from intervene_probe import EMPTY, probe_patch_channels_for_square_color
+from intervene_probe import probe_patch_channels_for_square_color
 from intervene_tpr_probe import parse_explicit_probe_pairs  # noqa: E402
 from train_multilinear_tpr_probe import load_saved_multilinear_tpr_probe  # noqa: E402
-from train_tpr_probe import load_binding_to_residual_linear_map_from_artifact  # noqa: E402
-
-
-def resolve_binding_to_residual_projection(
-    binding_to_residual: dict | None,
-    *,
-    residual_projection: str,
-    probe_path: str | Path,
-    patch_layer: int,
-) -> dict | None:
-    if residual_projection not in {"auto", "learned", "pinv"}:
-        raise ValueError(
-            "Unsupported residual projection "
-            f"{residual_projection!r}; expected 'auto', 'learned', or 'pinv'"
-        )
-    if residual_projection == "pinv":
-        return None
-    if residual_projection == "learned" and binding_to_residual is None:
-        raise ValueError(
-            "No saved binding->residual map found for "
-            f"patch layer {patch_layer} in {probe_path}"
-        )
-    return binding_to_residual
 
 
 def make_multilinear_probe_stem(
@@ -121,7 +97,6 @@ def load_multilinear_factors(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    dict | None,
     int,
     dict,
 ]:
@@ -135,9 +110,15 @@ def load_multilinear_factors(
         probe.row_embeddings.detach().to(device),
         probe.col_embeddings.detach().to(device),
         probe.color_embeddings.detach().to(device),
-        load_binding_to_residual_linear_map_from_artifact(artifact, device=device),
         layer,
         artifact,
+    )
+
+
+def artifact_has_binding_to_residual(artifact: dict) -> bool:
+    saved_map = artifact.get("binding_to_residual")
+    return isinstance(saved_map, dict) and isinstance(
+        saved_map.get("weight"), torch.Tensor
     )
 
 
@@ -178,19 +159,6 @@ def build_multilinear_binding_space_constraints(
     )
 
 
-def solve_multilinear_binding_delta_for_selected_squares(
-    selected_spatial_features: torch.Tensor,
-    selected_color_deltas: torch.Tensor,
-    *,
-    row_dim: int,
-    col_dim: int,
-) -> torch.Tensor:
-    delta_binding_flat = (
-        torch.linalg.pinv(selected_spatial_features) @ selected_color_deltas
-    )
-    return delta_binding_flat.reshape(row_dim, col_dim, selected_color_deltas.shape[-1])
-
-
 def build_multilinear_binding_delta_as_sum_of_outer_products(
     selected_spatial_features: torch.Tensor,
     selected_color_deltas: torch.Tensor,
@@ -206,68 +174,13 @@ def build_multilinear_binding_delta_as_sum_of_outer_products(
     return delta_binding_flat.reshape(row_dim, col_dim, selected_color_deltas.shape[-1])
 
 
-def apply_multilinear_probe_adjoint_to_binding_delta(
-    binding_map: torch.Tensor,
-    delta_binding: torch.Tensor,
-) -> torch.Tensor:
-    return torch.einsum("drck,rck->d", binding_map, delta_binding)
-
-
 def solve_residual_delta_for_binding_delta(
     binding_map: torch.Tensor,
     delta_binding: torch.Tensor,
-    binding_to_residual: dict | None = None,
 ) -> torch.Tensor:
     delta_binding_flat = delta_binding.reshape(-1)
-    if binding_to_residual is not None:
-        weight = binding_to_residual["weight"]
-        return delta_binding_flat.to(device=weight.device, dtype=weight.dtype) @ weight
-
     binding_map_flat = binding_map.reshape(binding_map.shape[0], -1)
     return torch.linalg.pinv(binding_map_flat.T) @ delta_binding_flat
-
-
-def board_value_to_multilinear_color_channel(board_value: int, move_idx: int) -> int:
-    if board_value == EMPTY:
-        return 0
-    if board_value not in (-1, 1):
-        raise ValueError(f"Unexpected board value {board_value}; expected -1, 0, or 1")
-
-    original_color = int(board_value + 1)
-    source_label, _ = probe_patch_channels_for_square_color(
-        original_color=original_color,
-        move_idx=move_idx,
-    )
-    return source_label
-
-
-def build_multilinear_binding_tensor_from_board_state(
-    row_embeddings: torch.Tensor,
-    col_embeddings: torch.Tensor,
-    color_embeddings: torch.Tensor,
-    board_state: np.ndarray | torch.Tensor,
-    move_idx: int,
-) -> torch.Tensor:
-    board_state_tensor = torch.as_tensor(
-        board_state,
-        device=row_embeddings.device,
-        dtype=torch.long,
-    )
-    color_channel_ids = torch.empty_like(board_state_tensor)
-    for row_idx in range(board_state_tensor.shape[0]):
-        for col_idx in range(board_state_tensor.shape[1]):
-            color_channel_ids[row_idx, col_idx] = board_value_to_multilinear_color_channel(
-                int(board_state_tensor[row_idx, col_idx].item()),
-                move_idx=move_idx,
-            )
-
-    selected_colors = color_embeddings[color_channel_ids]
-    return torch.einsum(
-        "xr,yc,xyk->rck",
-        row_embeddings,
-        col_embeddings,
-        selected_colors,
-    )
 
 
 def resolve_multilinear_resources_for_patch_layers(
@@ -281,8 +194,6 @@ def resolve_multilinear_resources_for_patch_layers(
     color_dim: int,
     use_bias: bool,
     exclude_center_squares: bool,
-    residual_projection: str,
-    binding_construction_method: str,
     d_model: int,
     device: torch.device,
 ) -> tuple[
@@ -294,14 +205,10 @@ def resolve_multilinear_resources_for_patch_layers(
     dict[int, torch.Tensor],
     dict[int, torch.Tensor],
     dict[int, torch.Tensor],
-    dict[int, dict | None],
 ]:
     explicit_probe_pairs = parse_explicit_probe_pairs(probe_pairs)
     resolved_patch_layers = (
         sorted(explicit_probe_pairs) if explicit_probe_pairs else list(patch_layers)
-    )
-    uses_residual_projection = (
-        binding_construction_method != "adjoint_outer_products"
     )
 
     probe_source_layers: dict[int, int] = {}
@@ -311,7 +218,6 @@ def resolve_multilinear_resources_for_patch_layers(
     row_embeddings_by_patch_layer: dict[int, torch.Tensor] = {}
     col_embeddings_by_patch_layer: dict[int, torch.Tensor] = {}
     color_embeddings_by_patch_layer: dict[int, torch.Tensor] = {}
-    binding_to_residual_by_patch_layer: dict[int, dict | None] = {}
 
     if explicit_probe_pairs:
         for patch_layer in resolved_patch_layers:
@@ -321,23 +227,12 @@ def resolve_multilinear_resources_for_patch_layers(
                 row_embeddings,
                 col_embeddings,
                 color_embeddings,
-                binding_to_residual,
                 loaded_layer,
                 artifact,
             ) = load_multilinear_factors(
                 probe_path=current_probe_path,
                 d_model=d_model,
                 device=device,
-            )
-            resolved_binding_to_residual = (
-                resolve_binding_to_residual_projection(
-                    binding_to_residual,
-                    residual_projection=residual_projection,
-                    probe_path=current_probe_path,
-                    patch_layer=patch_layer,
-                )
-                if uses_residual_projection
-                else binding_to_residual
             )
             probe_source_layers[patch_layer] = loaded_layer
             probe_paths_by_patch_layer[patch_layer] = str(current_probe_path)
@@ -350,19 +245,17 @@ def resolve_multilinear_resources_for_patch_layers(
                 "exclude_center_squares": bool(
                     artifact.get("config", {}).get("exclude_center_squares", False)
                 ),
-                "has_binding_to_residual": binding_to_residual is not None,
+                "has_binding_to_residual": artifact_has_binding_to_residual(artifact),
             }
             binding_maps_by_patch_layer[patch_layer] = binding_map
             row_embeddings_by_patch_layer[patch_layer] = row_embeddings
             col_embeddings_by_patch_layer[patch_layer] = col_embeddings
             color_embeddings_by_patch_layer[patch_layer] = color_embeddings
-            binding_to_residual_by_patch_layer[patch_layer] = resolved_binding_to_residual
     else:
         binding_maps_by_source_layer: dict[int, torch.Tensor] = {}
         row_embeddings_by_source_layer: dict[int, torch.Tensor] = {}
         col_embeddings_by_source_layer: dict[int, torch.Tensor] = {}
         color_embeddings_by_source_layer: dict[int, torch.Tensor] = {}
-        binding_to_residual_by_source_layer: dict[int, dict | None] = {}
         probe_paths_by_source_layer: dict[int, str] = {}
         probe_configs_by_source_layer: dict[int, dict] = {}
 
@@ -382,23 +275,12 @@ def resolve_multilinear_resources_for_patch_layers(
                 row_embeddings,
                 col_embeddings,
                 color_embeddings,
-                binding_to_residual,
                 loaded_layer,
                 artifact,
             ) = load_multilinear_factors(
                 probe_path=current_probe_path,
                 d_model=d_model,
                 device=device,
-            )
-            resolved_binding_to_residual = (
-                resolve_binding_to_residual_projection(
-                    binding_to_residual,
-                    residual_projection=residual_projection,
-                    probe_path=current_probe_path,
-                    patch_layer=source_layer,
-                )
-                if uses_residual_projection
-                else binding_to_residual
             )
             if loaded_layer != source_layer:
                 raise ValueError(
@@ -409,7 +291,6 @@ def resolve_multilinear_resources_for_patch_layers(
             row_embeddings_by_source_layer[source_layer] = row_embeddings
             col_embeddings_by_source_layer[source_layer] = col_embeddings
             color_embeddings_by_source_layer[source_layer] = color_embeddings
-            binding_to_residual_by_source_layer[source_layer] = resolved_binding_to_residual
             probe_paths_by_source_layer[source_layer] = str(current_probe_path)
             probe_configs_by_source_layer[source_layer] = {
                 "layer": loaded_layer,
@@ -420,7 +301,7 @@ def resolve_multilinear_resources_for_patch_layers(
                 "exclude_center_squares": bool(
                     artifact.get("config", {}).get("exclude_center_squares", False)
                 ),
-                "has_binding_to_residual": binding_to_residual is not None,
+                "has_binding_to_residual": artifact_has_binding_to_residual(artifact),
             }
 
         probe_source_layers = {
@@ -442,10 +323,6 @@ def resolve_multilinear_resources_for_patch_layers(
             layer: color_embeddings_by_source_layer[probe_source_layers[layer]]
             for layer in resolved_patch_layers
         }
-        binding_to_residual_by_patch_layer = {
-            layer: binding_to_residual_by_source_layer[probe_source_layers[layer]]
-            for layer in resolved_patch_layers
-        }
         probe_paths_by_patch_layer = {
             layer: probe_paths_by_source_layer[probe_source_layers[layer]]
             for layer in resolved_patch_layers
@@ -464,7 +341,6 @@ def resolve_multilinear_resources_for_patch_layers(
         row_embeddings_by_patch_layer,
         col_embeddings_by_patch_layer,
         color_embeddings_by_patch_layer,
-        binding_to_residual_by_patch_layer,
     )
 
 
