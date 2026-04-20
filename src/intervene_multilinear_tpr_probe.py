@@ -62,7 +62,7 @@ from intervene_multilinear_tpr_probe_utils import (  # noqa: E402
 
 
 SUPPORTED_INTERVENED_SQUARE_COUNTS = (1, 2, 3, 4)
-FIXED_PATCH_LAYERS = (2, 3, 4, 5, 6, 7)
+FIXED_PATCH_LAYERS = (0, 1, 2, 3, 4, 5, 6, 7)
 FIXED_PROBE_DIR = "probes/tpr_multilinear"
 FIXED_N_HEAD = 8
 FIXED_ROW_DIM = 8
