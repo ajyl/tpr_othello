@@ -32,3 +32,8 @@ python plot_scripts/plot_tpr_embedding_isomap.py probes/tpr/r52_f2/resid_6_tpr_r
 ```
 python plot_scripts/plot_tpr_embedding_binding.py --probe-path probes/tpr/r52_f2/resid_6_tpr_r52_f2_seed1111.pth --output-path binding.pdf
 ```
+
+# Plot Gram matrices:
+```
+python src/gram_matrix.py --probe-path probes/tpr_multilinear/u8_v8_f2/resid_6_mltpr_row8_col8_color2_seed1111.pth --probe-path2 probes/tpr_multilinear/u6_v8_f2/resid_6_mltpr_row6_col8_color2_seed1111.pth --factor row --output-path gram.pdf
+```
