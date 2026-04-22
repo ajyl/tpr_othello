@@ -22,3 +22,13 @@ python src/intervene_tpr_probe.py --probe-pair 0=probes/tpr/r52_f2/resid_0_tpr_r
 ```
 python src/intervene_multilinear_tpr_probe.py --probe-pair 0=probes/tpr_multilinear/row8_col8_color2/resid_0_mltpr_row8_col8_color2_seed1111.pth --probe-pair 1=probes/tpr_multilinear/row8_col8_color2/resid_1_mltpr_row8_col8_color2_seed1111.pth --probe-pair 2=probes/tpr_multilinear/row8_col8_color2/resid_2_mltpr_row8_col8_color2_seed1111.pth --probe-pair 3=probes/tpr_multilinear/row8_col8_color2/resid_3_mltpr_row8_col8_color2_seed1111.pth --probe-pair 4=probes/tpr_multilinear/row8_col8_color2/resid_4_mltpr_row8_col8_color2_seed1111.pth --probe-pair 5=probes/tpr_multilinear/row8_col8_color2/resid_5_mltpr_row8_col8_color2_seed1111.pth --probe-pair 6=probes/tpr_multilinear/row8_col8_color2/resid_6_mltpr_row8_col8_color2_seed1111.pth --probe-pair 7=probes/tpr_multilinear/row8_col8_color2/resid_7_mltpr_row8_col8_color2_seed1111.pth
 ```
+
+# Plot isomap:
+```
+python plot_scripts/plot_tpr_embedding_isomap.py probes/tpr/r52_f2/resid_6_tpr_r52_f2_seed1111.pth --output-path isomap --exclude-center-squares
+```
+
+# Plot binding PCA:
+```
+python plot_scripts/plot_tpr_embedding_binding.py --probe-path probes/tpr/r52_f2/resid_6_tpr_r52_f2_seed1111.pth --output-path binding.pdf
+```

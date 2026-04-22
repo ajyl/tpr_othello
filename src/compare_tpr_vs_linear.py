@@ -159,7 +159,7 @@ def compute_abs_cosine_similarity(
         tpr_weights.permute(1, 2, 3, 0),
         dim=-1,
         eps=1e-12,
-    ).abs()
+    )
 
 
 def compare_multilinear_probe_pair(
@@ -576,7 +576,7 @@ def plot_joint_cosine_heatmaps(
                     )
 
     colorbar = cax.colorbar(images[0])
-    colorbar.set_label("Absolute cosine similarity")
+    colorbar.set_label("Cosine Similarity")
     colorbar.locator = mticker.MaxNLocator(nbins=5)
     colorbar.update_ticks()
     colorbar.ax.tick_params(length=2.0, width=0.8)
