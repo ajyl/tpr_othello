@@ -37,3 +37,24 @@ python plot_scripts/plot_tpr_embedding_binding.py --probe-path probes/tpr/r52_f2
 ```
 python src/gram_matrix.py --probe-path probes/tpr_multilinear/u8_v8_f2/resid_6_mltpr_row8_col8_color2_seed1111.pth --probe-path2 probes/tpr_multilinear/u6_v8_f2/resid_6_mltpr_row6_col8_color2_seed1111.pth --factor row --output-path gram.pdf
 ```
+
+# Plot TPR vs. Linear probes:
+```
+python plot_scripts/tpr_vs_linear.py --linear-probe-path-top probes/linear/resid_6_linear.pth --distributed-linear-probe-path probes/linear/resid_6_linear.pth --local-tpr-probe-path probes/tpr/r64_f2/resid_6_tpr_r64_f2_seed1111.pth --distributed-tpr-probe-path probes/tpr/r56_f2/resid_6_tpr_r56_f2_seed1111.pth --heatmap-output-path tpr_vs_linear.pdf
+```
+
+
+# Plot TPR vs. SVD:
+```
+python plot_scripts/tpr_vs_svd.py --linear-probe-path probes/linear/resid_6_linear.pth --tpr-probe-path probes/tpr/r52_f2/resid_6_tpr_r52_f2_seed1111.pth --plot-output-path tpr_vs_svd.pdf --num-plot-points 40 --x-axis-units percentage
+```
+
+# Plot local k-NN based geometry of TPR:
+```
+python plot_scripts/local_geometry_knn.py --tpr-probe-path probes/tpr/r52_f2/resid_6_tpr_r52_f2_seed1111.pth --baseline-probe-path probes/tpr_baseline/tpr_baseline_d512_r52_f2_reprseed1111_seed1111.pth --iid-baseline-probe-path probes/tpr_baseline/tpr_baseline_d512_r52_f2_reprseed1111_iidboards_seed1111.pth --match-groundtruth-degree --include-diagonals --metric cosine --as-percentages --output-path local_geometry_knn.pdf
+```
+
+# Plot pairwise gap distance heatmaps:
+```
+python plot_scripts/local_geometry_heatmap.py --probe-path probes/tpr/r52_f2/resid_6_tpr_r52_f2_seed1111.pth --baseline-probe-path probes/tpr_baseline/tpr_baseline_d512_r52_f2_reprseed1111_seed1111.pth --iid-baseline-probe-path probes/tpr_baseline/tpr_baseline_d512_r52_f2_reprseed1111_iidboards_seed1111.pth --metric cosine --include-diagonals --gap-grid-plot-path grid.pdf
+```
